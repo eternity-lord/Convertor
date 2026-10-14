@@ -1,0 +1,16 @@
+name: Tests
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 libdbus-1-3
+      - run: pip install -r requirements-dev.txt
+      - run: python -m compileall -q app main.py
+      - run: python -m pytest -q
