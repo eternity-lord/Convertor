@@ -1,0 +1,840 @@
+# ============================================================================
+# EDIUS Ultimate Render Booster – GUI Edition (Full QSV)
+# Version 6.4 – "Edius Turbo Mode by Mohammad Irani"
+# Stable edition – only widely supported QSV parameters enabled
+# ── NEW: MP4 Profile Fixer tab added ──
+# ============================================================================
+
+import sys, os, time, subprocess, threading, logging, atexit
+from pathlib import Path
+import ctypes
+
+log = logging.getLogger("EdiusTurbo")
+log.setLevel(logging.INFO)
+
+def is_admin():
+    try: return ctypes.windll.shell32.IsUserAnAdmin()
+    except: return False
+if not is_admin():
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1)
+    sys.exit()
+
+import psutil
+try:
+    import win32process, win32api, win32con, winreg
+    HAVE_WIN32 = True
+except ImportError:
+    HAVE_WIN32 = False
+try:
+    import wmi
+    HAVE_WMI = True
+except ImportError:
+    HAVE_WMI = False
+
+FFMPEG_EXE = "ffmpeg"
+
+HIGH_PRIORITY_CLASS = 0x00000080
+NORMAL_PRIORITY_CLASS = 0x00000020
+IO_PRIO_HIGH = 2
+EDIUS_EXE = "EDIUS.exe"
+TEMP_THRESHOLD = 85
+
+PROC_POWER_GUID = "54533251-82be-4824-96c1-47b60b740d00"
+MIN_CPU_GUID = "893dee8e-2bef-41e0-89c6-b55d0929964c"
+MAX_CPU_GUID = "bc5038f7-23e0-4960-96da-33abaf5935ec"
+PARKING_SUBGROUP = "54533251-82be-4824-96c1-47b60b740d00"
+PARKING_MIN_CORES = "0cc5b647-c1df-4637-891a-dec35c318583"
+
+throttling_active = threading.Event()
+original_service_states = {}
+
+# ════════════════ System Functions ════════════════
+def find_boris_configs():
+    paths = []
+    bases = [r"C:\Program Files\BorisFX", r"C:\Program Files (x86)\BorisFX",
+             os.path.expandvars(r"%ProgramData%\BorisFX"), os.path.expandvars(r"%AppData%\BorisFX")]
+    for base in bases:
+        try:
+            for root, dirs, files in os.walk(base):
+                for f in files:
+                    if f.lower() == "s_config.text":
+                        paths.append(Path(root) / f)
+        except: pass
+    return paths
+
+def fix_boris_gpu_integration():
+    configs = find_boris_configs()
+    if not configs: return
+    for cfg in configs:
+        try:
+            lines = cfg.read_text(encoding="utf-8", errors="ignore").splitlines()
+            found = False
+            new_lines = []
+            for line in lines:
+                if "host_gpu_integration" in line.lower() and ":" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        value = parts[1].strip()
+                        if value == "0":
+                            line = f"{key}: 1"
+                            log.info(f"Fixed: {cfg.name} -> {key}: 1")
+                        else:
+                            log.info(f"Already active: {key}: {value}")
+                    found = True
+                new_lines.append(line)
+            if not found:
+                new_lines.append("host_gpu_integration: 1")
+                log.info(f"Added host_gpu_integration: 1 to {cfg.name}")
+            cfg.write_text("\n".join(new_lines), encoding="utf-8")
+        except Exception as e:
+            log.error(f"Boris config error: {e}")
+
+def find_power_plan(plan_name_hint):
+    try:
+        out = subprocess.run(["powercfg", "/list"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if plan_name_hint.lower() in line.lower():
+                parts = line.split()
+                for p in parts:
+                    if p.count('-') == 4 and len(p) == 36: return p
+    except: pass
+    return None
+
+def set_ultimate_power():
+    try:
+        subprocess.run(["powercfg", "/setactive", "e9a42b02-d5df-448d-aa00-03f14749eb61"], capture_output=True)
+        if "e9a42b02" in subprocess.run(["powercfg", "/getactivescheme"], capture_output=True, text=True).stdout.lower():
+            log.info("Power plan: Ultimate Performance"); return
+    except: pass
+    guid = find_power_plan("high performance")
+    if guid:
+        subprocess.run(["powercfg", "/setactive", guid], capture_output=True); log.info("Power plan: High Performance")
+    else:
+        subprocess.run(["powercfg", "/setactive", "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"], capture_output=True)
+    subprocess.run(["powercfg", "-setacvalueindex", "scheme_current", PROC_POWER_GUID, MIN_CPU_GUID, "100"], capture_output=True)
+    subprocess.run(["powercfg", "-setacvalueindex", "scheme_current", PROC_POWER_GUID, MAX_CPU_GUID, "100"], capture_output=True)
+    subprocess.run(["powercfg", "-setactive", "scheme_current"], capture_output=True)
+
+def disable_core_parking():
+    subprocess.run(["powercfg", "-setacvalueindex", "scheme_current", PARKING_SUBGROUP, PARKING_MIN_CORES, "100"], capture_output=True)
+    subprocess.run(["powercfg", "-setactive", "scheme_current"], capture_output=True)
+
+def set_timer_resolution():
+    try: ctypes.windll.winmm.timeBeginPeriod(1)
+    except: pass
+
+def disable_visual_effects():
+    if not HAVE_WIN32: return
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "VisualFXSetting", 0, winreg.REG_DWORD, 2); winreg.CloseKey(key)
+    except: pass
+
+def get_edius_handle():
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info['name'].lower() == EDIUS_EXE.lower():
+            pid = proc.info['pid']; handle = ctypes.windll.kernel32.OpenProcess(0x0200, False, pid)
+            if handle: return pid, handle
+    return None, None
+
+def set_edius_priority():
+    pid, handle = get_edius_handle()
+    if not handle: return
+    try:
+        ctypes.windll.kernel32.SetPriorityClass(handle, HIGH_PRIORITY_CLASS)
+        ioprio = ctypes.c_ulong(IO_PRIO_HIGH)
+        ctypes.windll.kernel32.SetProcessInformation(handle, 33, ctypes.byref(ioprio), ctypes.sizeof(ioprio))
+    except: pass
+    finally: ctypes.windll.kernel32.CloseHandle(handle)
+
+def kill_background_processes(custom_list=None):
+    lst = custom_list or ["chrome.exe","firefox.exe","msedge.exe","onedrive.exe","spotify.exe","steam.exe","discord.exe"]
+    for proc in psutil.process_iter(['pid','name']):
+        try:
+            if proc.info['name'].lower() in lst: proc.terminate()
+        except: pass
+
+def suspend_service(svc_name):
+    global original_service_states
+    if not HAVE_WIN32: return
+    try:
+        import win32serviceutil, win32service
+        status = win32serviceutil.QueryServiceStatus(svc_name)[1]
+        original_service_states[svc_name] = {'status': status}
+        if status == win32service.SERVICE_RUNNING: win32serviceutil.StopService(svc_name)
+        subprocess.run(["sc","config",svc_name,"start=","disabled"], capture_output=True)
+    except: pass
+
+def restore_services():
+    global original_service_states
+    if not HAVE_WIN32: return
+    import win32serviceutil, win32service
+    for svc, info in original_service_states.items():
+        try:
+            if info['status'] == win32service.SERVICE_RUNNING: win32serviceutil.StartService(svc)
+            subprocess.run(["sc","config",svc,"start=","auto"], capture_output=True)
+        except: pass
+    original_service_states.clear()
+
+def setup_defender_exclusion(folder_path):
+    try: subprocess.run(["powershell","-Command",f"Add-MpPreference -ExclusionPath '{folder_path}'"], capture_output=True)
+    except: pass
+
+def remove_defender_exclusion(folder_path):
+    try: subprocess.run(["powershell","-Command",f"Remove-MpPreference -ExclusionPath '{folder_path}'"], capture_output=True)
+    except: pass
+
+def create_ramdisk(size_mb=2048, drive_letter="R:"):
+    try:
+        subprocess.run(["imdisk","-a","-s",f"{size_mb}M","-m",drive_letter,"-p","/fs:ntfs /q /y"], capture_output=True, check=True)
+        return drive_letter
+    except: return None
+
+def remove_ramdisk(drive_letter="R:"):
+    try: subprocess.run(["imdisk","-d","-m",drive_letter], capture_output=True)
+    except: pass
+
+def get_cpu_temp():
+    if HAVE_WMI:
+        try:
+            w = wmi.WMI(namespace="root\\wmi"); temps = w.MSAcpi_ThermalZone()
+            if temps: return temps[0].CurrentTemperature / 10.0 - 273.15
+        except: pass
+    try:
+        for name, entries in psutil.sensors_temperatures().items():
+            for e in entries:
+                if 'core' in e.label.lower() or 'cpu' in e.label.lower(): return e.current
+    except: pass
+    return None
+
+# ════════════════ GUI Log Handler ════════════════
+class TextHandler(logging.Handler):
+    def __init__(self, text_widget):
+        super().__init__(); self.text = text_widget
+    def emit(self, record):
+        msg = self.format(record)
+        def append():
+            self.text.configure(state='normal'); self.text.insert('end', msg + '\n'); self.text.see('end'); self.text.configure(state='disabled')
+        self.text.after(0, append)
+
+# ════════════════ HQX Converter ════════════════
+class HQXConverter(threading.Thread):
+    def __init__(self, watch_folder, basic_settings, adv_settings, safe_mode=False):
+        super().__init__(daemon=True)
+        self.watch = Path(watch_folder)
+        self.basic = basic_settings
+        self.adv = adv_settings
+        self.safe_mode = safe_mode
+        self.processed = set()
+        self._stop_event = threading.Event()
+
+    def stop(self): self._stop_event.set()
+
+    def run(self):
+        log.info(f"Watching folder: {self.watch}")
+        while not self._stop_event.is_set():
+            try:
+                for f in self.watch.iterdir():
+                    if f.suffix.lower() in ['.avi','.mov','.mkv'] and f.name not in self.processed:
+                        if self._is_stable(f):
+                            self.processed.add(f.name)
+                            self._convert(f)
+            except Exception as e: log.error(f"Scan error: {e}")
+            time.sleep(3)
+
+    def _is_stable(self, filepath, wait=5):
+        try:
+            s1 = filepath.stat().st_size; time.sleep(wait)
+            s2 = filepath.stat().st_size; time.sleep(1)
+            return s1 == s2 == filepath.stat().st_size > 0
+        except: return False
+
+    def _convert(self, src):
+        dst = src.with_suffix(".mp4")
+        log.info(f"Converting: {src.name}")
+        cmd = [FFMPEG_EXE, "-i", str(src), "-c:v", self.basic.get("video_codec", "h264_qsv")]
+        cmd += ["-vf", "format=nv12"]
+        cmd += ["-fflags", "+genpts","-vsync","vfr","-max_muxing_queue_size", "1024"]
+
+        safe_keys = {"preset","profile","level","g","bf","look_ahead","look_ahead_depth",
+                     "trellis","async_depth","rdo","scenario","extbrc","low_delay_brc",
+                     "max_frame_size","max_frame_size_i","max_frame_size_p","max_frame_size_b",
+                     "refs"}
+
+        for key, val in self.adv.items():
+            if val is None or val == "" or val is False: continue
+            if self.safe_mode and key not in safe_keys: continue
+            if key in ("adaptive_i","adaptive_b","forced_idr","mbbrc","fixed_framerate","low_power","repeat_pps","weight_pred","vcm"):
+                continue
+            flag = f"-{key}"
+            if key == "profile": flag = "-profile:v"
+            if isinstance(val, bool) and val: cmd += [flag, "1"]
+            else: cmd += [flag, str(val)]
+
+        rc = self.basic.get("rate_control", "VBR")
+        if "global_quality" not in self.adv and rc == "CQP":
+            cmd += ["-global_quality", str(self.basic.get("global_quality", 23))]
+        if "b:v" not in self.adv and rc in ("VBR","CBR","ICQ","LA"):
+            cmd += ["-b:v", self.basic.get("bitrate","15M")]
+        if "maxrate" not in self.adv and rc == "VBR":
+            cmd += ["-maxrate", self.basic.get("maxrate","20M")]
+        if "bufsize" not in self.adv and rc == "VBR":
+            cmd += ["-bufsize", self.basic.get("bufsize","30M")]
+
+        if "preset" not in self.adv: cmd += ["-preset", self.basic.get("preset","veryslow")]
+        if "profile" not in self.adv and self.basic.get("profile"): cmd += ["-profile:v", self.basic["profile"]]
+        if "level" not in self.adv and self.basic.get("level"): cmd += ["-level", self.basic["level"]]
+        gop = self.basic.get("gop_size",0)
+        if "g" not in self.adv and gop > 0: cmd += ["-g", str(gop)]
+        bf = self.basic.get("bframes", -1)
+        if "bf" not in self.adv and bf >= 0: cmd += ["-bf", str(bf)]
+        if "look_ahead" not in self.adv and self.basic.get("look_ahead", False):
+            cmd += ["-look_ahead","1"]
+            if "look_ahead_depth" not in self.adv: cmd += ["-look_ahead_depth", str(self.basic.get("look_ahead_depth",60))]
+
+        cmd += ["-c:a", self.basic.get("audio_codec","aac"), "-b:a", self.basic.get("audio_bitrate","192k"), "-y", str(dst)]
+        log.info("Running: " + " ".join(cmd))
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if dst.exists() and dst.stat().st_size > 0:
+                log.info(f"Done: {dst.name}")
+                if self.basic.get("delete_source", True): src.unlink(); log.info(f"Deleted {src.name}")
+            else: log.error("Output file not created")
+        except subprocess.CalledProcessError as e:
+            log.error(f"FFmpeg error: {e.stderr.decode()}")
+
+
+# ════════════════════════════════════════════════════════════════
+# ██  NEW: MP4 Profile Fixer Thread                            ██
+# ██  فقط Profile/Level و Bitrate تغییر می‌کند                  ██
+# ██  به بقیه تنظیمات (رزولوشن، fps، صدا) دست نمی‌زند           ██
+# ════════════════════════════════════════════════════════════════
+class MP4ProfileFixer(threading.Thread):
+    """
+    MP4 های خروجی EDIUS را می‌گیرد و فقط:
+      1) Profile/Level را تغییر می‌دهد (مثلاً High 4.1)
+      2) Bitrate را با VBR/CBR/CQP تنظیم می‌کند
+      3) با QSV ری‌انکد می‌کند (سریع)
+    بقیه تنظیمات فیلم (رزولوشن، فریم‌ریت، صدا) دست‌نخورده باقی می‌ماند.
+    """
+    def __init__(self, folder, profile, level, rc_mode, bitrate, maxrate, bufsize, cqp, delete_src=False):
+        super().__init__(daemon=True)
+        self.folder = Path(folder)
+        self.profile = profile        # مثلاً "high"
+        self.level = level            # مثلاً "4.1"
+        self.rc_mode = rc_mode        # "VBR" / "CBR" / "CQP"
+        self.bitrate = bitrate        # مثلاً "15M"
+        self.maxrate = maxrate        # مثلاً "20M"
+        self.bufsize = bufsize        # مثلاً "30M"
+        self.cqp = cqp                # مثلاً "18"
+        self.delete_src = delete_src
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        mp4_files = list(self.folder.glob("*.mp4"))
+        # فایل‌هایی که قبلاً fix شدن رو رد کن
+        mp4_files = [f for f in mp4_files if "_fixed" not in f.stem]
+
+        if not mp4_files:
+            log.info("MP4 Fixer: هیچ فایل MP4 پیدا نشد!")
+            return
+
+        log.info(f"MP4 Fixer: {len(mp4_files)} فایل MP4 پیدا شد")
+
+        for src in mp4_files:
+            if self._stop_event.is_set():
+                log.info("MP4 Fixer: متوقف شد"); return
+            self._fix_one(src)
+
+        log.info("MP4 Fixer: تمام فایل‌ها پردازش شدند ✅")
+
+    def _fix_one(self, src):
+        dst = src.with_name(src.stem + "_fixed.mp4")
+        log.info(f"MP4 Fixer: پردازش {src.name}")
+
+        cmd = [
+            FFMPEG_EXE,
+            "-i", str(src),
+
+            # ── ویدیو: re-encode با QSV ──
+            "-c:v", "h264_qsv",
+
+            # ── فقط این دو تنظیم تغییر می‌کند ──
+            "-profile:v", self.profile,
+            "-level", self.level,
+        ]
+
+        # ── Rate Control ──
+        if self.rc_mode == "VBR":
+            cmd += ["-b:v", self.bitrate,
+                    "-maxrate", self.maxrate,
+                    "-bufsize", self.bufsize]
+        elif self.rc_mode == "CBR":
+            cmd += ["-b:v", self.bitrate,
+                    "-minrate", self.bitrate,
+                    "-maxrate", self.bitrate,
+                    "-bufsize", self.bufsize]
+        elif self.rc_mode == "CQP":
+            cmd += ["-global_quality", self.cqp]
+
+        # ── بقیه تنظیمات دست‌نخورده ──
+        cmd += [
+            "-c:a", "copy",              # صدا بدون تغییر
+            "-c:s", "copy",              # زیرنویس بدون تغییر (اگر داشته باشه)
+            "-map", "0",                 # تمام استریم‌ها
+            "-movflags", "+faststart",   # برای پخش سریع‌تر
+            "-y", str(dst)
+        ]
+
+        log.info("MP4 Fixer CMD: " + " ".join(cmd))
+
+        try:
+            result = subprocess.run(
+                cmd, check=True,
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if dst.exists() and dst.stat().st_size > 0:
+                log.info(f"MP4 Fixer: ✅ {dst.name} ({dst.stat().st_size // (1024*1024)} MB)")
+                if self.delete_src:
+                    src.unlink()
+                    log.info(f"MP4 Fixer: 🗑️ فایل اصلی حذف شد: {src.name}")
+            else:
+                log.error(f"MP4 Fixer: ❌ فایل خروجی ساخته نشد!")
+        except subprocess.CalledProcessError as e:
+            stderr_text = e.stderr.decode(errors='ignore') if e.stderr else "Unknown error"
+            log.error(f"MP4 Fixer: ❌ خطای FFmpeg:\n{stderr_text}")
+
+
+# ════════════════ Overlay ════════════════
+def start_overlay():
+    import tkinter as tk
+    root = tk.Toplevel(); root.title("Edius Turbo Monitor"); root.geometry("300x160+20+20")
+    root.attributes("-topmost", True, "-alpha", 0.85); root.overrideredirect(True); root.configure(bg="black")
+    tk.Label(root, text="EDIUS Turbo Boost", fg="cyan", bg="black", font=("Tahoma",10,"bold")).pack(anchor="w", padx=5, pady=(5,0))
+    tk.Label(root, text="Mohammad Irani", fg="gray", bg="black", font=("Tahoma",8)).pack(anchor="w", padx=5)
+    lbl_cpu = tk.Label(root, fg="white", bg="black", font=("Tahoma",9)); lbl_cpu.pack(anchor="w", padx=5, pady=1)
+    lbl_ram = tk.Label(root, fg="white", bg="black", font=("Tahoma",9)); lbl_ram.pack(anchor="w", padx=5, pady=1)
+    lbl_temp = tk.Label(root, fg="white", bg="black", font=("Tahoma",9)); lbl_temp.pack(anchor="w", padx=5, pady=1)
+    def update():
+        cpu = psutil.cpu_percent(); ram = psutil.virtual_memory().percent; t = get_cpu_temp()
+        lbl_cpu.config(text=f"CPU: {cpu}%"); lbl_ram.config(text=f"RAM: {ram}%")
+        lbl_temp.config(text=f"Temp: {t:.1f}°C" if t else "Temp: --°C", fg="red" if (t and t > TEMP_THRESHOLD) else "white")
+        root.after(2000, update)
+    update(); return root
+
+# ════════════════ Guards ════════════════
+def priority_guard():
+    while True:
+        if not throttling_active.is_set(): set_edius_priority()
+        time.sleep(10)
+
+def temp_throttle_guard():
+    warned = False; throttled = False
+    while True:
+        t = get_cpu_temp()
+        if t and t > TEMP_THRESHOLD:
+            if not warned:
+                log.warning(f"CPU temp {t:.1f}°C - throttling EDIUS priority")
+                warned = True; throttling_active.set()
+                pid, handle = get_edius_handle()
+                if handle:
+                    ctypes.windll.kernel32.SetPriorityClass(handle, NORMAL_PRIORITY_CLASS)
+                    ctypes.windll.kernel32.CloseHandle(handle); throttled = True
+        else:
+            if throttled and t and t <= TEMP_THRESHOLD - 5:
+                log.info("CPU cooled – restoring High priority"); throttling_active.clear(); set_edius_priority(); throttled = False
+            warned = False
+        time.sleep(10)
+
+def memory_guard():
+    while True:
+        try:
+            for flag in (1,2): ctypes.windll.ntdll.NtSetSystemInformation(0x50, ctypes.byref(ctypes.c_ulong(flag)), ctypes.sizeof(ctypes.c_ulong))
+        except: pass
+        for proc in psutil.process_iter(['pid','name']):
+            try:
+                if proc.info['name'].lower() in ["system","system idle process",EDIUS_EXE.lower()]: continue
+                handle = ctypes.windll.kernel32.OpenProcess(0x1F0FFF, False, proc.info['pid'])
+                if handle:
+                    ctypes.windll.kernel32.SetProcessWorkingSetSize(handle, -1, -1); ctypes.windll.kernel32.CloseHandle(handle)
+            except: continue
+        time.sleep(60)
+
+def cleanup():
+    log.info("Cleaning up..."); throttling_active.clear(); restore_services()
+atexit.register(cleanup)
+
+
+# ════════════════ Main GUI ════════════════
+class EdiusTurboApp:
+    def __init__(self, root):
+        self.root = root; root.title("EDIUS Ultimate Render Booster v6.4 – Mohammad Irani")
+        root.geometry("900x750"); root.minsize(850,700)
+        tk.Frame(root).pack(side="bottom", fill="x", pady=5)
+        self.notebook = ttk.Notebook(root); self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.setup_system_tab()
+        self.setup_convert_tab()
+        self.setup_advanced_qsv_tab()
+        self.setup_mp4fixer_tab()      # ◄── تب جدید
+        self.setup_log_tab()
+
+        log_handler = TextHandler(self.log_text)
+        log_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", "%H:%M:%S"))
+        log.addHandler(log_handler)
+        self.apply_system_tweaks()
+        threading.Thread(target=priority_guard, daemon=True).start()
+        threading.Thread(target=memory_guard, daemon=True).start()
+        threading.Thread(target=temp_throttle_guard, daemon=True).start()
+        self.overlay = start_overlay(); self.converter = None; self.mp4_fixer = None
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ── System Tweaks Tab ──
+    def setup_system_tab(self):
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="System Tweaks")
+        self.var_kill_apps = tk.BooleanVar(); self.var_ramdisk = tk.BooleanVar()
+        self.var_services = tk.BooleanVar(value=True); self.var_visual_fx = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab, text="Kill resource-hungry apps", variable=self.var_kill_apps).pack(anchor="w", padx=10, pady=2)
+        ttk.Checkbutton(tab, text="Create 2GB RAM disk (R:)", variable=self.var_ramdisk).pack(anchor="w", padx=10, pady=2)
+        ttk.Checkbutton(tab, text="Suspend unnecessary services", variable=self.var_services).pack(anchor="w", padx=10, pady=2)
+        ttk.Checkbutton(tab, text="Disable visual effects", variable=self.var_visual_fx).pack(anchor="w", padx=10, pady=2)
+        ttk.Button(tab, text="Apply Tweaks Now", command=self.apply_system_tweaks).pack(pady=15)
+
+    def apply_system_tweaks(self):
+        def task():
+            fix_boris_gpu_integration(); set_ultimate_power(); disable_core_parking(); set_timer_resolution()
+            if self.var_visual_fx.get(): disable_visual_effects()
+            set_edius_priority()
+            if self.var_services.get():
+                for s in ["SysMain","WSearch","OneSyncSvc","MapsBroker","lfsvc"]: suspend_service(s)
+            if self.var_kill_apps.get(): kill_background_processes()
+            self.ramdisk_path = create_ramdisk(2048, "R:") if self.var_ramdisk.get() else None
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── HQX Converter Tab ──
+    def setup_convert_tab(self):
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="HQX Converter")
+        canvas = tk.Canvas(tab); scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        frame = ttk.Frame(canvas); frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0), window=frame, anchor="nw"); canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True); scrollbar.pack(side="right", fill="y")
+
+        ttk.Label(frame, text="Watch Folder:").grid(row=0, column=0, sticky="w", pady=2, padx=5)
+        self.watch_folder_var = tk.StringVar(); ttk.Entry(frame, textvariable=self.watch_folder_var, width=40).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(frame, text="Browse", command=self.browse_folder).grid(row=0, column=2, pady=2)
+
+        basic = ttk.LabelFrame(frame, text="Basic QSV Settings", padding=10)
+        basic.grid(row=1, column=0, columnspan=3, pady=10, sticky="ew", padx=5)
+
+        ttk.Label(basic, text="Video Codec:").grid(row=0, column=0, sticky="w", pady=2)
+        self.vcodec_var = tk.StringVar(value="h264_qsv"); ttk.Combobox(basic, textvariable=self.vcodec_var, values=["h264_qsv","hevc_qsv","av1_qsv"], width=15).grid(row=0, column=1, sticky="w", pady=2)
+
+        ttk.Label(basic, text="Rate Control:").grid(row=1, column=0, sticky="w", pady=2)
+        self.rc_var = tk.StringVar(value="CQP")
+        rc_combo = ttk.Combobox(basic, textvariable=self.rc_var, values=["CQP","VBR","CBR","ICQ","LA"], width=15)
+        rc_combo.grid(row=1, column=1, sticky="w", pady=2); rc_combo.bind('<<ComboboxSelected>>', self.on_rc_change)
+        self.rc_frame = ttk.Frame(basic); self.rc_frame.grid(row=2, column=0, columnspan=3, pady=5, sticky="ew")
+        self.build_rc_widgets()
+
+        ttk.Label(basic, text="Audio Codec:").grid(row=3, column=0, sticky="w", pady=2)
+        self.acodec_var = tk.StringVar(value="aac"); ttk.Combobox(basic, textvariable=self.acodec_var, values=["aac","mp3","copy"], width=15).grid(row=3, column=1, sticky="w", pady=2)
+        ttk.Label(basic, text="Audio Bitrate:").grid(row=3, column=2, sticky="w", pady=2); self.abitrate_var = tk.StringVar(value="192k"); ttk.Entry(basic, textvariable=self.abitrate_var, width=8).grid(row=3, column=3, padx=5, pady=2)
+        self.delete_src_var = tk.BooleanVar(value=True); ttk.Checkbutton(basic, text="Delete HQX after conversion", variable=self.delete_src_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=5)
+
+        btn_frame = ttk.Frame(frame); btn_frame.grid(row=2, column=0, columnspan=3, pady=10)
+        self.start_btn = ttk.Button(btn_frame, text="Start Watching", command=self.start_converter); self.start_btn.pack(side="left", padx=5)
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_converter, state="disabled"); self.stop_btn.pack(side="left", padx=5)
+
+    def build_rc_widgets(self):
+        for w in self.rc_frame.winfo_children(): w.destroy()
+        rc = self.rc_var.get()
+        if rc == "CQP":
+            ttk.Label(self.rc_frame, text="Global Quality (1-51, lower=better):").pack(side="left")
+            self.qp_var = tk.StringVar(value="15")
+            ttk.Entry(self.rc_frame, textvariable=self.qp_var, width=8).pack(side="left", padx=5)
+        else:
+            ttk.Label(self.rc_frame, text="Bitrate:").pack(side="left"); self.bitrate_var = tk.StringVar(value="15M"); ttk.Entry(self.rc_frame, textvariable=self.bitrate_var, width=8).pack(side="left", padx=2)
+            if rc == "VBR":
+                ttk.Label(self.rc_frame, text="Maxrate:").pack(side="left"); self.maxrate_var = tk.StringVar(value="20M"); ttk.Entry(self.rc_frame, textvariable=self.maxrate_var, width=8).pack(side="left", padx=2)
+                ttk.Label(self.rc_frame, text="Bufsize:").pack(side="left"); self.bufsize_var = tk.StringVar(value="30M"); ttk.Entry(self.rc_frame, textvariable=self.bufsize_var, width=8).pack(side="left", padx=2)
+
+    def on_rc_change(self, event=None): self.build_rc_widgets()
+    def browse_folder(self):
+        from tkinter import filedialog; folder = filedialog.askdirectory()
+        if folder: self.watch_folder_var.set(folder)
+
+    # ── QSV Advanced Tab ──
+    def setup_advanced_qsv_tab(self):
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="QSV Advanced")
+        self.safe_mode_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tab, text="Safe Mode (only widely supported options)", variable=self.safe_mode_var).pack(anchor="w", padx=5, pady=5)
+
+        canvas = tk.Canvas(tab); scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        self.adv_frame = ttk.Frame(canvas); self.adv_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0), window=self.adv_frame, anchor="nw"); canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True); scrollbar.pack(side="right", fill="y")
+
+        self.adv_vcodec_var = tk.StringVar(value="h264_qsv")
+        ttk.Label(self.adv_frame, text="Codec:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Combobox(self.adv_frame, textvariable=self.adv_vcodec_var, values=["h264_qsv","hevc_qsv","av1_qsv"], width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        self.adv_vcodec_var.trace_add('write', lambda *a: self.populate_advanced_options())
+        self.dyn_options_frame = ttk.Frame(self.adv_frame); self.dyn_options_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.populate_advanced_options()
+
+    def populate_advanced_options(self):
+        for w in self.dyn_options_frame.winfo_children(): w.destroy()
+        codec = self.adv_vcodec_var.get(); self.adv_vars = {}
+        common = [
+            ("preset","Preset","combo","veryslow",["veryfast","faster","fast","medium","slow","slower","veryslow"]),
+            ("profile","Profile","combo","high",["","baseline","main","high","high10","high422","high444"]),
+            ("level","Level","str","4.1"),
+            ("g","GOP Size","int","250"),
+            ("bf","B-frames","int","3"),
+            ("look_ahead","Look-ahead","bool","True"),
+            ("look_ahead_depth","Look-ahead Depth","int","60"),
+            ("trellis","Trellis","combo","3",["0","1","2","3"]),
+            ("async_depth","Async Depth","int","4"),
+            ("rdo","RDO","int","1"),
+            ("extbrc","Extended BRC","bool","True"),
+            ("low_delay_brc","Low Delay BRC","bool","False"),
+            ("max_frame_size","Max Frame Size","int",""),
+            ("max_frame_size_i","Max I-Frame","int",""),
+            ("max_frame_size_p","Max P-Frame","int",""),
+            ("max_frame_size_b","Max B-Frame","int",""),
+            ("scenario","Scenario","combo","",["","unknown","displayremoting","videoconference","archive","livestreaming","cameracapture","gameshow"]),
+            ("refs","Reference Frames","int","4"),
+        ]
+        params = common[:]
+        if codec == "hevc_qsv":
+            params += [("main10","10-bit","bool","False"), ("gpb","GPB","bool","False")]
+        for i, item in enumerate(params):
+            param, label, ptype, default, *opt = item; options = opt[0] if opt else None
+            row = i//2; col = (i%2)*3
+            ttk.Label(self.dyn_options_frame, text=label+":").grid(row=row, column=col, sticky="e", padx=(10,2), pady=2)
+            if ptype == "bool":
+                var = tk.BooleanVar(value=(default.lower()=="true")); ttk.Checkbutton(self.dyn_options_frame, variable=var).grid(row=row, column=col+1, sticky="w", pady=2); self.adv_vars[param] = var
+            elif ptype == "combo":
+                var = tk.StringVar(value=default); ttk.Combobox(self.dyn_options_frame, textvariable=var, values=options or [], width=15).grid(row=row, column=col+1, sticky="w", pady=2); self.adv_vars[param] = var
+            else:
+                var = tk.StringVar(value=default); ttk.Entry(self.dyn_options_frame, textvariable=var, width=18).grid(row=row, column=col+1, sticky="w", pady=2); self.adv_vars[param] = var
+
+    def get_advanced_params(self):
+        params = {}
+        for key, var in self.adv_vars.items():
+            if isinstance(var, tk.BooleanVar):
+                if var.get(): params[key] = True
+            else:
+                val = var.get().strip()
+                if val and val not in ("none","unknown",""): params[key] = val
+        return params
+
+    # ════════════════════════════════════════════════════════════
+    # ██  NEW TAB: MP4 Profile Fixer                           ██
+    # ════════════════════════════════════════════════════════════
+    def setup_mp4fixer_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="🎬 MP4 Profile Fixer")
+
+        # ── عنوان ──
+        title_frame = ttk.Frame(tab)
+        title_frame.pack(fill="x", padx=10, pady=(10, 5))
+        ttk.Label(title_frame, text="MP4 Profile Fixer – QSV",
+                  font=("Tahoma", 12, "bold")).pack(anchor="w")
+        ttk.Label(title_frame,
+                  text="فقط Profile/Level و Bitrate تغییر می‌کند – بقیه تنظیمات فیلم دست‌نخورده باقی می‌ماند",
+                  font=("Tahoma", 9)).pack(anchor="w")
+
+        # ── پوشه ──
+        folder_frame = ttk.LabelFrame(tab, text="پوشه فایل‌های MP4", padding=10)
+        folder_frame.pack(fill="x", padx=10, pady=5)
+
+        self.fix_folder_var = tk.StringVar()
+        ttk.Label(folder_frame, text="پوشه:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(folder_frame, textvariable=self.fix_folder_var, width=50).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(folder_frame, text="Browse...", command=self._browse_fix_folder).grid(row=0, column=2, padx=5, pady=5)
+
+        # ── تنظیمات Profile ──
+        profile_frame = ttk.LabelFrame(tab, text="تنظیمات Profile (فقط همین تغییر می‌کند)", padding=10)
+        profile_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(profile_frame, text="Profile:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.fix_profile_var = tk.StringVar(value="high")
+        ttk.Combobox(profile_frame, textvariable=self.fix_profile_var,
+                     values=["baseline", "main", "high", "high10", "high422", "high444"],
+                     width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+
+        ttk.Label(profile_frame, text="Level:").grid(row=0, column=2, sticky="w", padx=5, pady=5)
+        self.fix_level_var = tk.StringVar(value="4.1")
+        ttk.Combobox(profile_frame, textvariable=self.fix_level_var,
+                     values=["3.0", "3.1", "4.0", "4.1", "4.2", "5.0", "5.1", "5.2"],
+                     width=10).grid(row=0, column=3, sticky="w", padx=5, pady=5)
+
+        # ── تنظیمات Bitrate ──
+        bitrate_frame = ttk.LabelFrame(tab, text="تنظیمات Bitrate (فقط همین تغییر می‌کند)", padding=10)
+        bitrate_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(bitrate_frame, text="Rate Control:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.fix_rc_var = tk.StringVar(value="VBR")
+        fix_rc_combo = ttk.Combobox(bitrate_frame, textvariable=self.fix_rc_var,
+                                     values=["VBR", "CBR", "CQP"], width=10)
+        fix_rc_combo.grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        fix_rc_combo.bind('<<ComboboxSelected>>', self._on_fix_rc_change)
+
+        # فریم داینامیک برای تنظیمات بیت‌ریت
+        self.fix_rc_frame = ttk.Frame(bitrate_frame)
+        self.fix_rc_frame.grid(row=1, column=0, columnspan=6, sticky="ew", padx=5, pady=5)
+        self._build_fix_rc_widgets()
+
+        # ── گزینه حذف فایل اصلی ──
+        options_frame = ttk.Frame(tab)
+        options_frame.pack(fill="x", padx=10, pady=5)
+        self.fix_delete_src_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="حذف فایل اصلی بعد از تبدیل موفق",
+                        variable=self.fix_delete_src_var).pack(anchor="w")
+
+        # ── توضیحات ──
+        info_frame = ttk.LabelFrame(tab, text="چه کاری انجام می‌دهد؟", padding=10)
+        info_frame.pack(fill="x", padx=10, pady=5)
+        info_text = (
+            "✅ Profile ویدیو را به مقدار انتخابی تغییر می‌دهد (مثلاً High 4.1)\n"
+            "✅ Bitrate را با VBR/CBR/CQP تنظیم می‌کند\n"
+            "✅ از Intel QSV (h264_qsv) برای re-encode سریع استفاده می‌کند\n"
+            "⛔ به رزولوشن، فریم‌ریت، صدا و سایر تنظیمات دست نمی‌زند\n"
+            "📁 فایل خروجی با پسوند _fixed.mp4 ذخیره می‌شود"
+        )
+        ttk.Label(info_frame, text=info_text, font=("Tahoma", 9), justify="left").pack(anchor="w")
+
+        # ── دکمه‌ها ──
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(pady=15)
+        self.fix_start_btn = ttk.Button(btn_frame, text="🚀  شروع Fix کردن MP4 ها",
+                                         command=self._start_mp4_fixer)
+        self.fix_start_btn.pack(side="left", padx=10)
+        self.fix_stop_btn = ttk.Button(btn_frame, text="⏹  توقف",
+                                        command=self._stop_mp4_fixer, state="disabled")
+        self.fix_stop_btn.pack(side="left", padx=10)
+
+    def _build_fix_rc_widgets(self):
+        for w in self.fix_rc_frame.winfo_children(): w.destroy()
+        rc = self.fix_rc_var.get()
+
+        if rc == "CQP":
+            ttk.Label(self.fix_rc_frame, text="Quality (1-51, کمتر=بهتر):").pack(side="left", padx=5)
+            self.fix_cqp_var = tk.StringVar(value="18")
+            ttk.Entry(self.fix_rc_frame, textvariable=self.fix_cqp_var, width=8).pack(side="left", padx=5)
+        else:
+            ttk.Label(self.fix_rc_frame, text="Bitrate:").pack(side="left", padx=5)
+            self.fix_bitrate_var = tk.StringVar(value="15M")
+            ttk.Entry(self.fix_rc_frame, textvariable=self.fix_bitrate_var, width=8).pack(side="left", padx=2)
+
+            if rc == "VBR":
+                ttk.Label(self.fix_rc_frame, text="Max Rate:").pack(side="left", padx=5)
+                self.fix_maxrate_var = tk.StringVar(value="20M")
+                ttk.Entry(self.fix_rc_frame, textvariable=self.fix_maxrate_var, width=8).pack(side="left", padx=2)
+
+            ttk.Label(self.fix_rc_frame, text="Buffer Size:").pack(side="left", padx=5)
+            self.fix_bufsize_var = tk.StringVar(value="30M")
+            ttk.Entry(self.fix_rc_frame, textvariable=self.fix_bufsize_var, width=8).pack(side="left", padx=2)
+
+    def _on_fix_rc_change(self, event=None):
+        self._build_fix_rc_widgets()
+
+    def _browse_fix_folder(self):
+        from tkinter import filedialog
+        folder = filedialog.askdirectory()
+        if folder: self.fix_folder_var.set(folder)
+
+    def _start_mp4_fixer(self):
+        folder = self.fix_folder_var.get()
+        if not folder:
+            log.error("MP4 Fixer: لطفاً یک پوشه انتخاب کنید!"); return
+
+        rc = self.fix_rc_var.get()
+        bitrate = getattr(self, 'fix_bitrate_var', tk.StringVar(value="15M")).get() if rc != "CQP" else ""
+        maxrate = getattr(self, 'fix_maxrate_var', tk.StringVar(value="20M")).get() if rc == "VBR" else bitrate
+        bufsize = getattr(self, 'fix_bufsize_var', tk.StringVar(value="30M")).get() if rc != "CQP" else ""
+        cqp     = getattr(self, 'fix_cqp_var', tk.StringVar(value="18")).get() if rc == "CQP" else ""
+
+        self.mp4_fixer = MP4ProfileFixer(
+            folder=folder,
+            profile=self.fix_profile_var.get(),
+            level=self.fix_level_var.get(),
+            rc_mode=rc,
+            bitrate=bitrate,
+            maxrate=maxrate,
+            bufsize=bufsize,
+            cqp=cqp,
+            delete_src=self.fix_delete_src_var.get()
+        )
+        self.mp4_fixer.start()
+        self.fix_start_btn.config(state="disabled")
+        self.fix_stop_btn.config(state="normal")
+        log.info(f"MP4 Fixer: شروع شد – Profile={self.fix_profile_var.get()} Level={self.fix_level_var.get()} RC={rc}")
+
+    def _stop_mp4_fixer(self):
+        if self.mp4_fixer:
+            self.mp4_fixer.stop()
+            self.mp4_fixer = None
+        self.fix_start_btn.config(state="normal")
+        self.fix_stop_btn.config(state="disabled")
+        log.info("MP4 Fixer: متوقف شد")
+
+    # ── Log Tab ──
+    def setup_log_tab(self):
+        tab = ttk.Frame(self.notebook); self.notebook.add(tab, text="Log")
+        self.log_text = tk.Text(tab, wrap="word", state="disabled", bg="black", fg="lime")
+        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        scroll = ttk.Scrollbar(self.log_text, command=self.log_text.yview); self.log_text['yscrollcommand'] = scroll.set; scroll.pack(side="right", fill="y")
+
+    # ── HQX Converter Start/Stop ──
+    def start_converter(self):
+        folder = self.watch_folder_var.get()
+        if not folder: return
+        basic = {
+            "video_codec": self.vcodec_var.get(),
+            "preset": "veryslow",
+            "rate_control": self.rc_var.get(),
+            "profile": "high",
+            "level": "4.1",
+            "gop_size": 250,
+            "bframes": 3,
+            "look_ahead": True,
+            "look_ahead_depth": 60,
+            "audio_codec": self.acodec_var.get(),
+            "audio_bitrate": self.abitrate_var.get(),
+            "delete_source": self.delete_src_var.get(),
+        }
+        rc = self.rc_var.get()
+        if rc == "CQP":
+            basic["global_quality"] = int(self.qp_var.get()) if self.qp_var.get().isdigit() else 15
+        else:
+            basic["bitrate"] = self.bitrate_var.get()
+            if rc == "VBR":
+                basic["maxrate"] = self.maxrate_var.get()
+                basic["bufsize"] = self.bufsize_var.get()
+        adv = self.get_advanced_params()
+        safe = self.safe_mode_var.get()
+        self.converter = HQXConverter(folder, basic, adv, safe); self.converter.start()
+        self.start_btn.config(state="disabled"); self.stop_btn.config(state="normal")
+        setup_defender_exclusion(folder)
+
+    def stop_converter(self):
+        if self.converter: self.converter.stop(); self.converter = None
+        self.start_btn.config(state="normal"); self.stop_btn.config(state="disabled")
+
+    def on_close(self):
+        if self.converter: self.converter.stop()
+        if self.mp4_fixer: self.mp4_fixer.stop()
+        if hasattr(self, 'ramdisk_path') and self.ramdisk_path: remove_ramdisk("R:")
+        self.overlay.destroy(); self.root.destroy()
+
+
+if __name__ == "__main__":
+    import tkinter as tk; from tkinter import ttk
+    root = tk.Tk(); app = EdiusTurboApp(root); root.mainloop()
