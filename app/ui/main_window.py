@@ -38,6 +38,7 @@ class MainWindow(GlassWindow):
     capabilities_ready = Signal(object)
     scan_ready = Signal(object)
     metrics_ready = Signal(object)
+    temperature_ready = Signal(object)
     background_log = Signal(str, str, str, str)
     cleanup_done = Signal()
 
@@ -51,13 +52,25 @@ class MainWindow(GlassWindow):
         if geometry:
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
         self.manager = QueueManager()
-        parallel = settings.get('parallel','Auto')
-        self.manager.limit = 0 if parallel == 'Auto' else int(parallel)
+        # One-time migration: old Auto=two/GPU or explicit four must not carry unsafe defaults.
+        if settings.get('safety_policy_version',0) < 1:
+            for key,value in {'safe_mode':True,'high_priority':False,'parallel':'1',
+                              'safety_policy_version':1}.items():
+                settings.set(key,value)
+        parallel = str(settings.get('parallel','1'))
+        self.manager.limit = min(3,max(1,int(parallel) if parallel != 'Auto' else 1))
+        settings.set('parallel',str(self.manager.limit))
+        self.manager.safe_mode = settings.get('safe_mode',True)
+        self.manager.high_priority = settings.get('high_priority',False)
+
         self.encoding = EncodingWindow(self.manager)
         self.monitor = Monitor()
         self.watcher = None
         self.scan_busy = False
         self.metric_busy = False
+        self.temperature_busy = False
+        self.last_temperature_poll = 0
+        self.last_temperature = None
         self.cap_busy = False
         self.last_metrics = {}
         self.completed_ids = set()
@@ -74,6 +87,7 @@ class MainWindow(GlassWindow):
         self.scan_ready.connect(self.scanned)
         self.capabilities_ready.connect(self.set_capabilities)
         self.metrics_ready.connect(self.set_metrics)
+        self.temperature_ready.connect(self.set_temperature)
         self.tweaks = None
         self.tweak_busy = False
         self.tweaks_ready = threading.Event()
@@ -83,6 +97,7 @@ class MainWindow(GlassWindow):
         threading.Thread(target=make_tweaks, daemon=True).start()
         self.encoding.completion_action.connect(self.complete)
         self.create_tray()
+        self.manager.safety_alert.connect(self.safety_toast)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self.poll_metrics)
@@ -145,6 +160,7 @@ class MainWindow(GlassWindow):
         self.settings_page.language_changed.connect(self.change_language)
         self.settings_page.reprobe.connect(lambda: self.probe_hardware(True))
         self.settings_page.concurrency_changed.connect(lambda value: setattr(self.manager,'limit',value))
+        self.settings_page.execution_changed.connect(self.set_execution_policy)
         self.settings_page.monitor_requested.connect(self.monitor.show)
         self.tweaks_page.apply_requested.connect(self.apply_tweaks)
         self.tweaks_page.restore_requested.connect(self.restore_tweaks)
@@ -343,13 +359,26 @@ class MainWindow(GlassWindow):
         def run():
             import psutil
             values = {'cpu':psutil.cpu_percent(interval=.1), 'ram':psutil.virtual_memory().percent,
-                      'temp':cpu_temperature()}
+                      'temp':self.last_temperature}
             self.metrics_ready.emit(values)
         threading.Thread(target=run,daemon=True).start()
+        # A slow Windows WMI temperature query must never delay the 1Hz CPU/RAM guard.
+        now = time.monotonic()
+        if not self.temperature_busy and now - self.last_temperature_poll >= 5:
+            self.temperature_busy = True
+            self.last_temperature_poll = now
+            def temperature():
+                self.temperature_ready.emit(cpu_temperature())
+            threading.Thread(target=temperature,daemon=True).start()
+
+    def set_temperature(self, value):
+        self.temperature_busy = False
+        self.last_temperature = value
 
     def set_metrics(self, values):
         self.metric_busy = False
         self.last_metrics = values
+        self.manager.observe_resources(values['ram'], values['cpu'])
         self.dashboard.metrics['CPU load'].setText(f'{values["cpu"]:.0f}%')
         self.dashboard.metrics['GPU load'].setText('N/A')
         temperature = f'{values["temp"]:.1f}°C' if values['temp'] is not None else 'N/A'
@@ -366,6 +395,18 @@ class MainWindow(GlassWindow):
         if metric != 'GPU':
             self.dashboard.chart.values.extend(list(self.telemetry[metric])[-span:])
         self.dashboard.chart.update()
+
+    def set_execution_policy(self, safe_mode, high_priority):
+        self.manager.safe_mode = safe_mode
+        self.manager.high_priority = high_priority
+
+    def safety_toast(self, reason):
+        if self.tray.isVisible():
+            self.tray.showMessage('EDIUS Booster — Safety pause', reason,
+                                  QSystemTrayIcon.Warning, 10000)
+        else:
+            self.cap_badge.setText('Safety pause — see Encoding queue')
+        self.encoding.open()
 
     def apply_tweaks(self, options):
         if self.tweak_busy or not self.tweaks:
@@ -393,7 +434,7 @@ class MainWindow(GlassWindow):
         if self.watcher:
             self.logs.append('WARN','Finish action ignored while folder watch is enabled')
             return
-        if any(j.status == 'Failed' for j in self.manager.jobs):
+        if any(j.status in ('Failed','Blocked','Warning') for j in self.manager.jobs):
             self.logs.append('WARN','Finish action cancelled because some files failed')
             return
         if os.name != 'nt':

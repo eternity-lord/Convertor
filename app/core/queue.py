@@ -8,8 +8,9 @@ from PySide6.QtCore import QObject, Signal, QTimer, Slot
 from .worker import EncodeWorker
 from .ffprobe import probe
 from .pipeline import output_path
+from .safety import LOW_RAM_BYTES, SustainedLoadGuard
 
-TERMINAL = {'TV-Safe ✓', 'Done', 'Failed', 'Skipped'}
+TERMINAL = {'TV-Safe ✓', 'Done', 'Warning', 'Blocked', 'Failed', 'Skipped'}
 ACTIVE = {'Analyzing', 'Encoding', 'Paused', 'Verifying'}
 MAX_JOBS = 5000
 
@@ -22,6 +23,7 @@ class Job:
     media: object = None
     data: dict = field(default_factory=lambda: {'status': 'Waiting', 'progress': 0})
     queued_at: float = field(default_factory=time.monotonic)
+    skip_analysis_event: object = field(default_factory=threading.Event)
     worker: object = None
     thread: object = None
 
@@ -39,6 +41,7 @@ class QueueManager(QObject):
     incoming = Signal(object)
     analyzed = Signal(str, object)
     analysis_done = Signal()
+    safety_alert = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -47,6 +50,11 @@ class QueueManager(QObject):
         self.running = False
         self.paused = False
         self.limit = 0
+        self.safe_mode = True
+        self.high_priority = False
+        self.load_guard = SustainedLoadGuard()
+        self.safety_reason = ''
+        self.low_ram_warned = False
         self.thermal_limit = False
         self.started_at = None
         self.finished_at = None
@@ -87,7 +95,7 @@ class QueueManager(QObject):
         changes = dict(changes)
         for key in ('details','warning','reason'):
             if key in changes:
-                changes[key] = str(changes[key])[-12000:]
+                changes[key] = str(changes[key])[-32000:] if key == 'details' else str(changes[key])[-12000:]
         if 'errors' in changes:
             changes['errors'] = [str(x)[:2000] for x in changes['errors'][:20]]
         job.data.update(changes)
@@ -105,7 +113,7 @@ class QueueManager(QObject):
         if 'detected' in changes:
             self.log.emit('INFO', changes['detected'], job.source.name, details)
         if changes.get('status') in TERMINAL:
-            self.log.emit('DONE' if job.status != 'Failed' else 'ERROR',
+            self.log.emit('WARN' if job.status == 'Warning' else 'ERROR' if job.status in ('Failed','Blocked') else 'DONE',
                           changes.get('badge', changes.get('reason', job.status)), job.source.name, details)
         self.changed.emit()
 
@@ -124,9 +132,16 @@ class QueueManager(QObject):
                     if self.analysis_cancel.is_set():
                         break
                     try:
-                        self.analyzed.emit(job.id, probe(job.source))
+                        self.updated.emit(job.id, {'status':'Analyzing', 'step':'Reading streams…'})
+                        class CombinedEvent:
+                            def is_set(inner):
+                                return self.analysis_cancel.is_set() or job.skip_analysis_event.is_set()
+                        media = probe(job.source, cancel=CombinedEvent(),
+                                      step=lambda message: self.updated.emit(job.id, {'step':message}),
+                                      fallback_fps=job.options.fps if job.options.fps != 'Auto' else '25')
+                        self.analyzed.emit(job.id, media)
                     except Exception as exc:
-                        self.updated.emit(job.id, {'errors': [str(exc)], 'status': 'Failed'})
+                        self.updated.emit(job.id, {'reason':str(exc), 'errors':[str(exc)], 'status':'Blocked'})
             finally:
                 self.analysis_done.emit()
         threading.Thread(target=run, daemon=True).start()
@@ -136,8 +151,14 @@ class QueueManager(QObject):
         job = self.find(identity)
         if job:
             job.media = media
+            if job.status == 'Skipped':
+                return
+            job.data['status'] = 'Waiting'
+            job.data['step'] = 'Unverified' if not media.cadence.verified else 'Analysis complete'
+            job.data['analysis_seconds'] = media.analysis_seconds
+            job.data['analysis_unverified'] = not media.cadence.verified
             job.data['detected'] = media.badge()
-            self.log.emit('INFO', media.badge(), job.source.name, '')
+            self.log.emit('INFO' if media.cadence.verified else 'WARN', media.badge(), job.source.name, '')
             self.changed.emit()
 
     @Slot()
@@ -181,9 +202,16 @@ class QueueManager(QObject):
         import psutil
         mem = psutil.virtual_memory()
         hardware = self.capabilities.get('codecs', {}).get('h264_qsv', {}).get('available', False)
-        limit = self.limit or (2 if hardware else 1)
+        limit = min(3, max(1, self.limit or 1))
         # RAM guard: never queue many full-frame surfaces on a low-memory machine.
-        if self.thermal_limit or mem.available < 1_500_000_000 or mem.percent > 85:
+        if mem.available < LOW_RAM_BYTES:
+            limit = 1
+            if not self.low_ram_warned:
+                self.log.emit('WARN', 'Free RAM is below 3 GB: forcing one job. Close other apps if necessary.', '', '')
+                self.low_ram_warned = True
+        else:
+            self.low_ram_warned = False
+        if self.thermal_limit:
             limit = 1
         if any(j.data.get('pipeline') == 'CPU fallback' for j in active) and not self.limit:
             limit = 1
@@ -208,6 +236,8 @@ class QueueManager(QObject):
                 except Exception as exc:
                     self._update(job.id, {'status':'Failed', 'errors':[str(exc)]})
                     continue
+            job.options.safe_mode = self.safe_mode
+            job.options.high_priority = self.high_priority
             job.data['status'] = 'Analyzing'
             job.worker = EncodeWorker(job, job.options, self.capabilities, self.updated.emit)
             job.thread = threading.Thread(target=job.worker.run, daemon=True)
@@ -224,21 +254,43 @@ class QueueManager(QObject):
             if job.worker and job.thread and job.thread.is_alive():
                 job.worker.cancel.set()
                 threading.Thread(target=job.worker.stop, daemon=True).start()
-            elif job.status == 'Waiting':
+            elif job.status in ('Waiting','Analyzing'):
                 job.data.update(status='Skipped', reason='Stopped by user')
         self.changed.emit()
 
     def pause_all(self, paused):
         self.paused = paused
+        if not paused:
+            self.safety_reason = ''
+            self.load_guard = SustainedLoadGuard()
         for job in self.jobs:
             if job.worker:
-                job.worker.pause(paused)
+                threading.Thread(target=job.worker.pause, args=(paused,), daemon=True).start()
+
+    def skip_analysis(self, identity):
+        job = self.find(identity)
+        if job and job.status in ('Waiting','Analyzing'):
+            job.skip_analysis_event.set()
+            job.data['step'] = 'Skipping analysis…'
+            self.changed.emit()
+
+    def observe_resources(self, ram_percent, cpu_percent, now=None):
+        active = (self.running or self.analysis_running) and not self.paused
+        reason = self.load_guard.observe(ram_percent, cpu_percent,
+                                         time.monotonic() if now is None else now, active=active)
+        if reason:
+            self.safety_reason = reason
+            self.pause_all(True)
+            self.log.emit('WARN', reason, '', '')
+            self.safety_alert.emit(reason)
+            self.changed.emit()
 
     def retry(self, identity):
         job = self.find(identity)
         if job and job.status in TERMINAL and not (job.thread and job.thread.is_alive()):
             job.data = {'status': 'Waiting', 'progress': 0}
             job.worker = None
+            job.skip_analysis_event.clear()
             self.changed.emit()
 
     def reorder(self, identities):
@@ -248,7 +300,7 @@ class QueueManager(QObject):
 
     def summary(self):
         counts = {s: sum(j.status == s for j in self.jobs) for s in
-                  ('Waiting', 'Analyzing', 'Encoding', 'Paused', 'Verifying', 'Done', 'TV-Safe ✓', 'Failed', 'Skipped')}
+                  ('Waiting', 'Analyzing', 'Encoding', 'Paused', 'Verifying', 'Done', 'TV-Safe ✓', 'Warning', 'Blocked', 'Failed', 'Skipped')}
         durations = [(j.media.duration if j.media else 0) for j in self.jobs]
         total_duration = sum(durations)
         complete = sum(d * (1 if j.status in TERMINAL else j.data.get('progress', 0) / 100)

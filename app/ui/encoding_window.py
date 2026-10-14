@@ -31,7 +31,8 @@ class QueueTable(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.horizontalHeader().setSectionResizeMode(3, QHeaderView.Interactive)
+        self.setColumnWidth(3,300)
         self.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.verticalHeader().hide()
         self.setSelectionBehavior(QTableWidget.SelectRows)
@@ -61,6 +62,7 @@ class EncodingWindow(GlassWindow):
         self.manager = manager
         self.preview_busy = False
         self.last_preview = 0
+        self.last_refresh = 0
         self.current_id = None
         self.last_speed_sample = 0
         self.last_order = []
@@ -105,7 +107,7 @@ class EncodingWindow(GlassWindow):
         layout.addWidget(current, 2)
         self.pause_button = button('Pause', self.toggle_pause)
         layout.addLayout(row(self.pause_button, button('Stop current', self.stop_current),
-                             button('Skip file', self.skip_selected), button('Stop all', manager.stop_all),
+                             button('Skip file', self.skip_selected), button('Skip analysis', self.skip_analysis), button('Stop all', manager.stop_all),
                              button('Open output folder', self.open_output), button('Clear finished', self.clear_finished)))
         self.topmost = Toggle('Always on top')
         self.topmost.toggled.connect(self.set_topmost)
@@ -150,9 +152,15 @@ class EncodingWindow(GlassWindow):
         if job and job.status in ACTIVE:
             return job
         active = next((j for j in self.manager.jobs if j.status in ACTIVE), None)
-        return active or job
+        return active or job or next((j for j in reversed(self.manager.jobs) if j.status in TERMINAL),None)
 
     def refresh(self):
+        now = time.monotonic()
+        if now - self.last_refresh < .5:
+            return
+        self.last_refresh = now
+        self.paused = self.manager.paused
+        self.pause_button.setText(tr('Resume' if self.paused else 'Pause'))
         if not self.isVisible():
             return
         summary = self.manager.summary()
@@ -162,9 +170,11 @@ class EncodingWindow(GlassWindow):
         self.summary.setText(
             f"{tr('Found')} {summary['total']}  ·  {tr('Waiting')} {c['Waiting']}  ·  "
             f"{tr('Encoding')} {sum(c[x] for x in ACTIVE)}  ·  {tr('Done')} {c['Done']+c['TV-Safe ✓']}  ·  "
-            f"{tr('Failed')} {c['Failed']}  ·  {tr('Skipped')} {c['Skipped']}  ·  {summary['size']/1e9:.2f} GB\n"
+            f"{tr('Warning')} {c['Warning']}  ·  Blocked {c['Blocked']}  ·  {tr('Failed')} {c['Failed']}  ·  {tr('Skipped')} {c['Skipped']}  ·  {summary['size']/1e9:.2f} GB\n"
             f"{summary['progress']:.1f}%  ·  {tr('Elapsed')} {clock(summary['elapsed'])}  ·  "
             f"{tr('Remaining')} {clock(remaining)}  ·  {tr('Finish')} {finish}")
+        if self.manager.safety_reason:
+            self.summary.setText(self.summary.text() + '\n' + self.manager.safety_reason)
         self.overall.setValue(int(summary['progress']))
         jobs = self.manager.jobs
         identities = [j.id for j in jobs]
@@ -178,8 +188,15 @@ class EncodingWindow(GlassWindow):
             v = job.media.video if job.media else {}
             info = (f"{v.get('width','?')}×{v.get('height','?')} · "
                     f"{float(job.media.fps):.3f} fps · {v.get('codec_name','?')}") if job.media else 'Waiting for analysis'
+            state = tr(job.status)
+            if job.status in ('Warning','Failed','Blocked'):
+                state += ': ' + job.data.get('reason','; '.join(job.data.get('errors',[])))
+            elif job.status == 'Analyzing':
+                state += ': ' + tr(job.data.get('step','Reading streams…'))
+            elif job.data.get('analysis_unverified') and job.status == 'Waiting':
+                state += ' · ' + tr('Unverified')
             values = [job.source.name, info, job.options.preset + '\n' + job.data.get('output', ''),
-                      tr(job.status), f"{job.data.get('progress',0):.1f}%"]
+                      state, f"{job.data.get('progress',0):.1f}%"]
             for col, value in enumerate(values):
                 item = self.table.item(index, col)
                 if item is None:
@@ -191,7 +208,8 @@ class EncodingWindow(GlassWindow):
                     item.setData(Qt.UserRole, job.id)
                     item.setToolTip(str(job.source) + '\n' + job.data.get('detected', ''))
                 if col == 3:
-                    item.setForeground(QColor('#8ecba5' if job.status == 'TV-Safe ✓' else '#f87171' if job.status == 'Failed' else '#baa4ba'))
+                    item.setToolTip(job.data.get('badge') or job.data.get('reason') or job.data.get('step',''))
+                    item.setForeground(QColor('#8ecba5' if job.status == 'TV-Safe ✓' else '#e8c278' if job.status == 'Warning' else '#f87171' if job.status in ('Failed','Blocked') else '#baa4ba'))
         self.table.blockSignals(False)
         job = self.current()
         if not job:
@@ -199,10 +217,24 @@ class EncodingWindow(GlassWindow):
         d = job.data
         self.current_title.setText(job.source.name)
         self.current_progress.setValue(int(d.get('progress', 0)))
-        self.pipeline.setText(d.get('pipeline', tr(job.status)))
+        self.pipeline.setText(tr('Warning') if job.status == 'Warning' else d.get('pipeline', tr(job.status)))
+        self.pipeline.setToolTip(d.get('reason',''))
+        self.pipeline.setStyleSheet('color:#e8c278; background:#302715;' if job.status == 'Warning' else '')
         total_frames = round(job.media.duration * float(d['target'].fps)) if job.media and d.get('target') else '?'
         target = d.get('target')
         target_text = f'{target.width}×{target.height} · {float(target.fps):.3f} CFR · {target.profile}@{target.level} · 8-bit 4:2:0 · AAC 48k stereo' if target else ''
+        output = d.get('output_probe',{})
+        if output.get('video'):
+            video = output['video']
+            audio = next(iter(output.get('audio',[])),{})
+            target_text = (f"Output (ffprobe): {video.get('width')}×{video.get('height')} · "
+                           f"{video.get('r_frame_rate')} fps · {video.get('profile')} / level {video.get('level')} · "
+                           f"{video.get('pix_fmt')} · {audio.get('codec_name','no audio')} "
+                           f"{audio.get('channels','?')}ch / {audio.get('sample_rate','?')} Hz")
+        elif output.get('error'):
+            target_text = 'Output unverified: ' + str(output['error'])
+        else:
+            target_text = 'Target: ' + target_text
         self.metrics.setText(
             f"Encoding frame {d.get('frame',0):,} of {total_frames}\n"
             f"{tr('Elapsed')} {clock(d.get('elapsed',0))}   ·   {tr('Remaining')} {clock(d.get('remaining'))}\n"
@@ -234,7 +266,7 @@ class EncodingWindow(GlassWindow):
             self.preview.setPixmap(QPixmap.fromImage(image).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def toggle_pause(self):
-        self.paused = not self.paused
+        self.paused = not self.manager.paused
         self.manager.pause_all(self.paused)
         self.pause_button.setText(tr('Resume' if self.paused else 'Pause'))
 
@@ -242,6 +274,15 @@ class EncodingWindow(GlassWindow):
         job = self.current()
         if job and job.worker:
             threading.Thread(target=job.worker.stop, daemon=True).start()
+
+    def skip_analysis(self):
+        index = self.table.currentRow()
+        identity = self.table.item(index,0).data(Qt.UserRole) if index >= 0 else self.current_id
+        if not identity:
+            job = next((j for j in self.manager.jobs if j.status == 'Analyzing'),None)
+            identity = job.id if job else None
+        if identity:
+            self.manager.skip_analysis(identity)
 
     def skip_selected(self):
         index = self.table.currentRow()
@@ -264,13 +305,15 @@ class EncodingWindow(GlassWindow):
         identity = self.table.item(index, 0).data(Qt.UserRole)
         job = self.manager.find(identity)
         menu = QMenu(self)
-        for text in ['Remove', 'Move to top', 'Retry', 'Open folder', 'Show ffmpeg command']:
+        for text in ['Remove', 'Move to top', 'Retry', 'Skip analysis', 'Open folder', 'Show ffmpeg command']:
             action = menu.addAction(tr(text))
             action.setData(text)
             if text in ('Remove', 'Move to top'):
                 action.setEnabled(job.status == 'Waiting' or (text == 'Remove' and job.status in TERMINAL))
             if text == 'Retry':
                 action.setEnabled(job.status in TERMINAL)
+            if text == 'Skip analysis':
+                action.setEnabled(job.status in ('Waiting','Analyzing'))
         chosen = menu.exec(self.table.viewport().mapToGlobal(position))
         if not chosen:
             return
@@ -282,6 +325,8 @@ class EncodingWindow(GlassWindow):
             self.manager.jobs.insert(0, job)
         elif text == 'Retry':
             self.manager.retry(identity)
+        elif text == 'Skip analysis':
+            self.manager.skip_analysis(identity)
         elif text == 'Open folder':
             dialogs.open_folder(job.data.get('output', str(job.source)))
         else:

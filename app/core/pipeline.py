@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from .process import tool
+from .safety import encoding_threads
 from .tv_rules import choose_target, timescale
 
 
@@ -36,15 +37,16 @@ def build_command(media, options, output, capabilities=None, software=False, exe
         full = False
     cmd = [executable or tool('ffmpeg'), '-hide_banner', '-nostdin', '-y',
            '-loglevel', 'warning', '-progress', 'pipe:1', '-nostats',
-           '-fflags', '+genpts', '-threads', '0', '-filter_threads', '2']
+           '-fflags', '+genpts', '-threads', str(encoding_threads(options.safe_mode)), '-filter_threads', '2']
     if gpu:
         cmd += ['-init_hw_device', 'qsv=hw', '-filter_hw_device', 'hw']
     if full:
-        cmd += ['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv']
+        cmd += ['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv',
+                '-extra_hw_frames', '16' if options.safe_mode else '64']
     cmd += ['-i', str(media.path)]
     if not media.audio:
         cmd += ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']
-    cmd += ['-map', '0:v:0', '-map', ('0:a' if options.audio == 'Keep all' else '0:a:0')
+    cmd += ['-map', '0:v:0', '-map', ('0:a?' if options.audio == 'Keep all' else '0:a:0?')
             if media.audio else '1:a:0', '-sn', '-dn', '-map_metadata', '-1', '-map_chapters', '-1']
     keep_interlace = media.interlaced and not options.deinterlace
     top_first = media.video.get('field_order') in ('tt', 'tb')
@@ -62,7 +64,10 @@ def build_command(media, options, output, capabilities=None, software=False, exe
         filters = ['setpts=PTS-STARTPTS']
         if media.interlaced and options.deinterlace:
             filters += ['bwdif=mode=' + ('send_field' if options.double_rate else 'send_frame') + ':parity=auto:deint=all']
-        filters += [f'scale={target.width}:{target.height}:flags=bicubic' + (':interl=1' if keep_interlace else ''), 'setsar=1']
+        scaling = f'scale={target.width}:{target.height}:flags=bicubic' + (':interl=1' if keep_interlace else '')
+        if not media.metadata_verified:
+            scaling = f"scale=w='min(iw,{target.width})':h='min(ih,{target.height})':flags=bicubic:force_original_aspect_ratio=decrease:force_divisible_by=2"
+        filters += [scaling, 'setsar=1']
         if keep_interlace:
             filters += ['setfield=' + ('tff' if top_first else 'bff')]
         ratio = target.fps / media.fps
@@ -72,7 +77,7 @@ def build_command(media, options, output, capabilities=None, software=False, exe
         elif options.method == 'Motion interpolation' and not duplication:
             filters += [f'minterpolate=fps={fps}:mi_mode=mci']
         filters += [f'fps=fps={fps}:round=near']
-        filters += ['format=nv12', 'hwupload=extra_hw_frames=32'] if gpu else ['format=yuv420p']
+        filters += ['format=nv12', 'hwupload=extra_hw_frames=16' if options.safe_mode else 'hwupload=extra_hw_frames=64'] if gpu else ['format=yuv420p']
     else:
         filters.append('setsar=1')
     # Finite output length, integral number of frames. AAC is padded/trimmed to the same timeline.
@@ -81,7 +86,7 @@ def build_command(media, options, output, capabilities=None, software=False, exe
             '-preset', options.encoder_preset if gpu else 'medium',
             '-profile:v', target.profile, '-level:v', target.level,
             '-fps_mode', 'cfr', '-r', fps, '-g', str(round(float(target.fps) * 2)),
-            '-bf', '0' if target.profile == 'baseline' else '2', '-refs', '3',
+            '-bf', '0' if target.profile == 'baseline' else str(options.bframes), '-refs', '3',
             '-flags', '+cgop+ilme+ildct' if keep_interlace else '+cgop',
             '-b:v', f'{target.bitrate:.4f}M', '-maxrate', f'{target.maxrate:.4f}M',
             '-bufsize', f'{target.bufsize:.4f}M']
@@ -99,23 +104,19 @@ def build_command(media, options, output, capabilities=None, software=False, exe
             if key in supported.get('tested_options', []):
                 cmd += [f'-{key}', str(val)]
     else:
-        cmd += ['-pix_fmt', 'yuv420p', '-threads', '0', '-x264-params', 'open-gop=0:force-cfr=1']
+        cmd += ['-pix_fmt', 'yuv420p', '-threads', str(encoding_threads(options.safe_mode)), '-x264-params', 'open-gop=0:force-cfr=1']
     video_start = float(media.video.get('start_time') or 0)
     audio_start = float(media.audio[0].get('start_time') or 0) if media.audio else video_start
     offset = audio_start - video_start
     audio_filter = f'asetpts=PTS-STARTPTS+({offset:.6f})/TB,aresample=async=1:first_pts=0,apad'
-    # Copy is explicit but not trusted; verification will list incompatibility.
-    if options.audio == 'Copy' and media.audio:
-        cmd += ['-c:a', 'copy']
+    # TV output always normalizes audio; legacy Copy selections cannot bypass this policy.
+    cmd += ['-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '48000', '-ac', '2', '-b:a', '192k']
+    if options.audio == 'Keep all' and media.audio:
+        for index, stream in enumerate(media.audio):
+            delta = float(stream.get('start_time') or 0) - video_start
+            cmd += [f'-filter:a:{index}', f'asetpts=PTS-STARTPTS+({delta:.6f})/TB,aresample=async=1:first_pts=0,apad']
     else:
-        cmd += ['-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '48000', '-ac', '2',
-                '-b:a', f'{target.audio_kbps}k']
-        if options.audio == 'Keep all' and media.audio:
-            for index, stream in enumerate(media.audio):
-                delta = float(stream.get('start_time') or 0) - video_start
-                cmd += [f'-filter:a:{index}', f'asetpts=PTS-STARTPTS+({delta:.6f})/TB,aresample=async=1:first_pts=0,apad']
-        else:
-            cmd += ['-af', audio_filter]
+        cmd += ['-af', audio_filter]
     color = 'bt709' if target.height > 576 else 'smpte170m'
     cmd += ['-tag:v', {'h264':'avc1', 'hevc':'hvc1', 'av1':'av01'}[output_codec], '-colorspace', color, '-color_primaries', color,
             '-color_trc', color, '-color_range', 'tv', '-strict', 'normal',

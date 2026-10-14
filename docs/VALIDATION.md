@@ -1,4 +1,6 @@
-# Validation report — 2026-10-14
+# Initial v7 validation — historical baseline
+
+**Superseded by [BUG-FIX ROUND 1](ROUND1.md).** Whole-file timestamp scans, failure-on-verification, automatic dual QSV jobs and high-priority defaults described below have been replaced. The original measurements are retained as historical evidence, not as the current behavior.
 
 ## Executed in the development sandbox
 

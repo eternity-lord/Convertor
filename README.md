@@ -1,14 +1,14 @@
-# EDIUS Ultimate Render Booster v7
+# EDIUS Ultimate Render Booster v7 — Bug-fix Round 1
 
-A Windows-first **PySide6 desktop application** for repairing EDIUS/Voukoder MP4 exports, watching HQX folders, and producing verified constant-frame-rate, TV-compatible files. Original application / credit: **Mohammad Irani**.
+Windows-first **PySide6 desktop application** for EDIUS/Voukoder MP4 repair, HQX watch-folder conversion, QSV encoding and TV compatibility inspection. Original application / credit: **Mohammad Irani**.
 
-![Actual Qt dashboard](docs/dashboard.png)
+![Qt dashboard](docs/dashboard.png)
 
-The original `mp4_profile_fixer_102502.txt`, design reference JPEG and implementation prompt are preserved unchanged. The v7 application does **not** import or execute the old Tkinter app.
+Original Tkinter source, visual reference and implementation prompt are preserved. The old application is never imported or executed. This round addresses false verification failures, slow analysis and unsafe execution defaults.
 
 ## Run on Windows
 
-Requirements: Windows 10/11 x64, Python **3.10–3.13**, FFmpeg **6+** and ffprobe from the **same build**. Intel graphics drivers are needed only for QSV; CPU conversion works without Intel hardware. Use a build containing `libx264`, `aac`, `fps`, `scale`, and optionally QSV encoders/filters.
+Windows 10/11 x64, Python **3.10–3.13**, FFmpeg **6+** with `libx264`/AAC and matching ffprobe. Intel drivers are necessary only for QSV; CPU fallback works without Intel hardware.
 
 ```powershell
 py -3.12 -m venv .venv
@@ -16,83 +16,79 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python main.py
 ```
 
-Put `ffmpeg.exe` and `ffprobe.exe` next to `main.py` (or next to the packaged executable), or put them on `PATH`. Missing tools appear in the application status and Logs, not as a startup crash. No video binaries are committed to Git.
+Put `ffmpeg.exe` and `ffprobe.exe` beside `main.py` / the packaged EXE, or on PATH. A missing executable produces a clear message. Use **Settings → Restart as administrator** only for opt-in Windows system tweaks. No system tuning is applied automatically, except restoration of a previous crash-recovery marker.
 
-Launch normally. System tuning is **not** applied on startup. Use **Settings → Restart as administrator** only when opting into Windows tweaks. UAC cancellation leaves the application running.
+## Safe defaults (Round 1)
 
-### First conversion
+- **One job**, **NORMAL CPU/I/O priority**, **Safe mode ON**, **High priority OFF**.
+- Safe mode uses `max(2, logical_cores - 2)` decode/encode threads, two filter threads, QSV async depth 4 and 16 extra upload frames. Where at least three CPUs are available, affinity reserves one or two logical cores for the OS/UI. A two-core PC cannot reserve cores while honoring the two-thread minimum; NORMAL scheduling still allows the UI to run.
+- Settings permits **1–3 jobs** with a visible warning. Free RAM below **3 GiB** overrides the setting to one job and logs why.
+- RAM >90% **or** CPU >95% sustained for ten seconds automatically pauses dispatch and active FFmpeg process trees. A tray notification / visible queue reason is shown. Free resources, then explicitly **Resume**. The guard is retained in Performance mode as well.
+- **Performance mode** enables unrestricted encoder threads / larger upload buffers and stops reserving affinity. It does not automatically enable High priority. Mode changes affect newly dispatched jobs, not a running encode.
+- An upgrade migrates old unsafe Auto/two-job or four-job settings back to one safe job once. Explicit choices made after that migration are preserved.
+- Encoding window refresh is capped at **two times per second**. Probes, conversions, previews and process pause/resume operations run in background threads. Pipe drainage is concurrent and memory-bounded.
 
-1. Open **MP4 Profile Fixer**, choose a folder, select a TV preset.
-2. **Analyze files** probes each MP4 recursively and shows detected cadence. Mixed folders are explicitly reported. **Auto** uses each file's own cadence; choose a fixed rate to force the entire batch to that exact rational rate.
-3. Select output, audio, overwrite and FAT32 policies. Default output: `_TV/name_TV.mp4`; originals are preserved.
-4. **Start Fix** analyzes waiting files before dispatch so queue ETA has duration information. The Encoding window opens automatically. Close it to hide it; reopen it from the sidebar or tray.
-5. Only a **verified** AVC output receives **TV-Safe ✓**. Inspect Logs → Details for commands / failures. A failed GPU encode or output verification receives **one software retry**.
+## Convert / inspect files
 
-Universal TV caps Auto to ≤1080p30; Samsung/LG/Sony permits 1080p60; 4K permits 2160p30. **Explicit Frame Rate selection wins over preset FPS caps**. A separate explicit FPS cap is still honored. 29.97 means `30000/1001`, not 30. Presets never promise playback on every TV model.
+1. Open **MP4 Profile Fixer**, choose a folder and preset. Files are discovered recursively; generated outputs are excluded.
+2. **Analyze files** reads stream metadata, then samples only the first ~20 seconds and three short middle/late/end windows. All ffprobe calls have a **15-second deadline**. No whole-file packet scan remains, including during output verification.
+3. The queue shows **Reading streams…** / **Checking frame timing…**. Select a row and **Skip analysis** (also in its context menu) to interrupt probing for that file.
+4. A timing timeout/skip marks analysis **Unverified** and conversion continues using known stream metadata. If stream metadata itself times out or is skipped, conservative geometry and a selected fixed rate (or 25 fps if Auto is unknown) are used; the eventual output remains a warning rather than being falsely certified. Originals are preserved.
+5. **Auto** selects each file's own standard rational cadence. Universal TV now preserves **1080p59.94/60** with legal Level 4.2 instead of silently halving the source rate. Other preset limits and an explicitly selected FPS cap still apply. Fixed 29.97/59.94 are exact `30000/1001` / `60000/1001`.
+6. Start conversion. The Encoding window opens automatically; closing it hides it without stopping the queue. Source deletion is **OFF** by default.
 
-**HQX Converter** recursively watches AVI/MOV/MKV. Files must have unchanged path, size and modification time for six seconds before queuing. Watching does not block while files are being written. H.264 is the default. HEVC/AV1 are selectable only when the corresponding QSV encoder is available; those outputs are labeled **verified**, not universally TV-safe. The 4K preset also offers a hardware-gated HEVC option with an older-TV warning. Software fallback deliberately returns to AVC.
+### Audio and timestamps
 
-## What is implemented
+TV audio is **always re-encoded**, even if an old settings file selected Copy:
 
-- **CFR engine:** three bounded packet samples before conversion; histogram-based cadence; exact standard rational rates; drop/duplicate, blend and motion interpolation; progressive / keep-interlaced / bob options. Output uses `fps` or capability-gated `vpp_qsv`, `-fps_mode cfr`, regenerated PTS, rate-based **video and movie timescales**, and negative-timestamp avoidance. Movie timescale prevents sub-millisecond negative DTS at 29.97 from MP4 edit-list rounding.
-- **Post-encode verification:** streams/format plus a **whole-file streaming packet scan** with a 64-packet reorder heap. Checks exact average/nominal/selected rate, timestamp cadence, negative PTS/DTS, profile, pixel format, level floor, dimensions/SAR, color tags, audio format/duration, extra streams, average bitrate ceiling and MP4 faststart. Timestamp data is not accumulated in RAM.
-- **TV policy:** AVC 8-bit 4:2:0, `avc1`, safe profile/auto-raised level, even dimensions, square pixels, closed two-second GOP command, 2 B-frames, 3 references, bounded VBV, limited BT.709/SD SMPTE170M tags, AAC-LC stereo 48 kHz, metadata/chapters removed. Missing audio gets silence. Copy / all-audio are explicit options and can trigger a compatibility retry.
-- **Audio:** offset-preserving timestamp normalization, asynchronous resampling, padding and an integral-frame output duration. Audio/video **duration** difference must be <40 ms. This is a timeline check, not lip-sync/content analysis.
-- **QSV:** binary-keyed seven-day capability cache, encoder/hwaccel discovery, sequential one-second AVC/HEVC/AV1 tests with low-power off/on, real AVC GPU decode/VPP test, individual optional-flag tests. CPU decode → NV12 upload → QSV for unsupported sources. Fully hardware-resident scaling/rate conversion only when the real probe passed. Fallback is libx264 medium.
-- **Queue/progress:** 0.5-second refresh, found/waiting/active/done/failed/skipped counts, source size, per-job media information and progress, frame counts, elapsed, EMA speed/ETA, overall throughput ETA, predicted size, background source preview, source/output summary, pipeline badge, real-data sparklines, waiting-row drag/reorder, context actions, pause/resume process trees, cancellation, retry and output-folder launchers.
-- **Concurrency:** Auto 2 on available QSV / 1 on CPU, manual 1–4, low-memory and thermal dispatch limits. A measured serial baseline can reduce future dispatch when parallel per-job throughput falls below 80%. Active jobs are allowed to drain; jobs are not killed to enforce a lower concurrency limit.
-- **Atomic outputs:** unique `.part.mp4` files; optional scratch-to-destination staging; rename only after verification. Custom-folder name collisions are reserved/renamed before parallel dispatch.
-- **FAT32:** size estimate warning, bitrate-to-fit, or closed-GOP stream-copy segments. Split parts are size-checked and reverified; the verified master is retained. Estimates are not exact file-size guarantees. Use exFAT/NTFS for long/high-bitrate programs.
-- **Windows tuning:** explicit toggles for temporary cloned power plan, core parking, process priority, thermal guard, timer resolution, visual effects, selected services, reversible background-app suspension, BorisFX GPU integration, optional ImDisk RAM disk, optional Defender folder exclusion. Write-ahead journal and restoration on exit / next startup. Service startup modes are never modified, and existing Defender exclusions are preserved. **No arbitrary working-set trimming and no app killing.**
-- **UI:** custom-painted rounded Qt shell, mauve gradients, glass cards, pills, custom animated toggle switches, chart, dashboard, Fixer, HQX, advanced QSV, Tweaks, Logs, Settings, Support, and Encoding window. Font files and OFL licenses are bundled. Dark non-native Qt file dialogs are used.
-- **Logs:** bounded structured records, level/search/file-name search filters, expandable command/stderr details, clipboard, JSON/text export, clear, auto-scroll. Technical details are capped rather than accumulated for hours.
-- **Settings:** `%APPDATA%\EdiusBooster\settings.json`; folders, conversion options, language, scratch, parallelism, encoder preset, advanced flags and main geometry. EN/فارسی through `app/i18n.py`; Persian navigation/core controls and RTL. Original Persian literals are retained in `assets/legacy_fa.json`, including legacy wording no longer accurate for v7; those obsolete claims are not shown as current behavior.
+```text
+-c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k
+-af asetpts=...,aresample=async=1:first_pts=0,apad
+```
 
-## Safety and practical limits
+Offset-aware timestamp normalization and AAC padding keep the original relative audio timing. Missing source audio receives a silent track when the stream probe is known. All output audio tracks are inspected for AAC/LC, ≤2 channels and 48 kHz.
 
-- **TV simulation is a rule checker, not a physical TV emulator.** AVC GOP closure / reference limits / VBV are set in the command; the verifier does not independently parse every SPS/slice/HRD bitstream rule. Packet cadence is checked across the complete output, but repeated visual frames and aesthetic motion judder cannot be disproved by timestamp analysis.
-- New color tags do **not** perform HDR→SDR tone mapping. HDR material needs a proper graded/tone-mapped SDR source; relabeling HDR as BT.709 is not a color-managed HDR workflow.
-- HEVC / AV1 hardware paths, actual Intel adapter behavior, Windows UAC/power/service restoration, thermal sensors, notifications and ImDisk need testing on the target PC. GPU utilization is **N/A**, not an invented percentage. Adapter name is detected where Windows exposes it; exact architectural generation is not inferred from branding.
-- Notification uses Qt's Windows tray notification API (OS presentation varies); completion uses the system beep, not a bundled custom sound. The Encoding window is reopenable from tray/sidebar; closing hides it. Minimization uses the normal taskbar behavior.
-- Progress shows **one selected active job** plus all concurrent jobs in the table, not a separate preview pane for every active job. Queue rows use source metadata rather than per-file thumbnails. UI is a close interpretation of the supplied design, not a claim of pixel-identical screenshots at every DPI.
-- Navigation/core controls are translated; some technical descriptions/diagnostics remain English. The log file filter is the combined text search (including file name), not a separate per-job dropdown.
-- Probe metadata has a bounded capture size and timeouts; pre-analysis samples at most 1,536 video packets total. Full verification keeps histograms (up to 4096 bins) and a 64-entry reorder heap. A malicious/malformed stream or insufficient metadata is rejected rather than guessed safe.
-- Queue capped at **5000 jobs**, log model **400 records**, visible log cards **100**, chart history **1800 points**, FFmpeg stderr tails **200 bounded lines**. FFmpeg surfaces still consume real memory: 4K motion interpolation or several GPU sessions can be expensive. On low-memory PCs use one job, drop/duplicate, no RAM disk, and a 1080p cap. No implementation can guarantee immunity to driver/OS out-of-memory errors.
-- Crash recovery runs when the app next starts with the necessary permissions. It cannot restore settings while the PC is powered off, recover destroyed unsaved work, or guarantee success if Windows denies changes. Pending recovery remains on disk for another attempt.
-- Choosing **Sleep / Shut down** in Encoding is explicit opt-in. It is ignored if files failed or folder watch is active. Shutdown has a 60-second grace period; `shutdown /a` cancels it. Originals are deleted only if the explicit deletion toggle is on and verification succeeded.
+Output commands keep `-fflags +genpts`, `-fps_mode cfr`, the selected rational `-r`, `-avoid_negative_ts make_zero`, and consistent video/movie timescales. **Negative packet DTS is not an error:** B-frame decoding can legitimately precede presentation. Verification instead requires video `start_time >= -0.1 s` and absolute audio/video start difference **<40 ms**, in addition to the duration check. A timing violation receives at most one CPU retry with **`-bf 0`**; the first successful output is preserved while retrying.
 
-## Tests
+Levels are calculated per file from output dimensions and FPS: 1080p30 → 4.1, 1080p59.94/60 → **4.2**, 2160p30 → 5.1. Lower manual levels are raised automatically.
+
+### Green, yellow and red results
+
+- **TV-Safe ✓**: output ffprobe values and sampled policy checks passed.
+- **Warning** (yellow): conversion succeeded, but compatibility, timestamp or inspection checks are inconclusive / violated. **The output is committed and kept**, and the original is never deleted. A failed timing-repair retry also keeps the first successful encoded output.
+- **Failed: actual reason**: real FFmpeg non-zero exit / launch failure or no nonempty output file, after its single software retry. It is never a bare failure label.
+- **Blocked: actual reason**: missing tools, invalid settings or input-analysis errors that prevent a job from starting.
+
+Logs → Details includes exact commands for both attempts, bounded stderr tails and the **output's actual ffprobe fields**: codec, profile, level, pixel format, dimensions, nominal/average FPS, audio codec/profile/channels/rate, start times and durations. Compatibility warnings do not generate red encoder-failure logs. Verification-only simulation also reports yellow rather than rejecting an existing file.
+
+## Other features
+
+- Capability-cached one-second QSV encoder / low-power / decode/VPP tests; hardware-resident or CPU-decode/upload pipelines where supported; libx264 fallback.
+- AVC 8-bit 4:2:0 / avc1, safe profiles, even dimensions / square pixels, closed two-second GOP, bounded VBV, limited BT.709/SD tags, AAC stereo and MP4 faststart. Metadata, chapters and extra data/subtitle streams are removed.
+- Recursive AVI/MOV/MKV watch folder: unchanged path, size and modification time for six seconds before enqueue. HEVC/AV1 are hardware-gated and labeled verified / modern-devices-only, not universally TV-safe.
+- Progress / ETA / size prediction, queue ordering, pause/resume, stop/skip, retry, atomic partial-file staging, optional scratch, output collision reservation and folder launchers.
+- FAT32 size warning, bitrate-to-fit or verified segments; a split warning retains the master output. Estimated size is not an exact size guarantee.
+- Explicit reversible Windows tweaks: cloned AC power plan, core parking, EDIUS priority, thermal guard, timer/visual effects/services, reversible application suspension, BorisFX integration, ImDisk and optional Defender exclusion. Neither priority nor thermal controls implicitly change power/core parking. A write-ahead marker restores originals on exit / next startup with adequate permissions. FFmpeg High priority is controlled separately in Settings.
+- Dark frameless Qt dashboard, custom cards/pills/toggles/chart, bounded structured Logs, monitor, persisted settings, EN/فارسی navigation and RTL. Bundled Poppins/Vazirmatn fonts include OFL licenses.
+
+## Limits and validation
+
+See **[Round 1 results](docs/ROUND1.md)** and the machine-readable **[output ffprobe report](docs/ROUND1_RESULTS.json)**. The real `Khanum 1.mp4` / `Agha 1.mp4` were **not supplied**; reported reruns use explicitly named synthetic stand-ins, not those originals.
+
+TV simulation is a policy checker, not a physical TV emulator. Sampled timestamps do not prove every timestamp / visual frame in a long program is correct. GOP/VBV options are set but not independently certified by a complete bitstream analyzer. No HDR→SDR tone mapping is performed. Genuine Intel driver behavior, Windows load/notification behavior and actual TV playback need target-machine checks.
+
+Queue capped at 5000 files, logs 400 records / 100 visible cards, charts 1800 points, bounded stderr tails, bounded probe stdout and at most 8192 retained PTS samples per window. These bounds reduce memory risk but cannot guarantee against OS/driver out-of-memory failures, especially for 4K interpolation. GPU load is honestly N/A when unavailable. UI is a close design interpretation rather than pixel-identical, and some technical descriptions remain English. The selected-job preview is not a separate pane per concurrent encode.
+
+## Tests / packaging
 
 ```powershell
 .\.venv\Scripts\python -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python -m pytest -q
-```
-
-On Linux/headless: `QT_QPA_PLATFORM=offscreen python -m pytest -q`. Native Qt EGL/GL, xkbcommon and D-Bus libraries must be installed for the GUI smoke tests. Integration tests require FFmpeg/ffprobe on PATH; missing-tool tests are skipped and explicitly reported. CI runs on Ubuntu 24.04.
-
-See [validation and acceptance status](docs/VALIDATION.md) for exactly what was exercised and what still requires real hardware.
-
-## Package on Windows
-
-Build on Windows, not Linux. Install dev requirements and put the desired FFmpeg executables in the project root if they should be bundled:
-
-```powershell
 .\.venv\Scripts\python -m PyInstaller --clean --noconfirm EdiusBooster.spec
-# Run dist\EdiusBooster\EdiusBooster.exe
 ```
 
-The one-folder spec includes fonts/icons and any local FFmpeg/ffprobe executables. Without bundled executables users can put them beside the EXE or on PATH. The EXE does not require admin by default. Respect your FFmpeg build's GPL/LGPL redistribution obligations and Intel driver licensing. Poppins and Vazirmatn use their included SIL Open Font Licenses.
+Build the EXE **on Windows**. The one-folder spec includes fonts/icons and local FFmpeg binaries if present. Respect FFmpeg GPL/LGPL redistribution requirements. On Linux/headless use `QT_QPA_PLATFORM=offscreen`; native EGL/GL/xkbcommon/D-Bus libraries and FFmpeg/ffprobe on PATH are needed to run all integration/GUI tests.
 
-## Layout
+Settings / recovery: `%APPDATA%\EdiusBooster\settings.json`, `restore.json`. Recovery cannot run while the PC is powered off; failed restoration remains journaled for a later attempt. Shutdown/sleep are explicit, are suppressed on warning/error results or watch mode, and shutdown has a 60-second cancellation period (`shutdown /a`).
 
-```text
-main.py
-app/i18n.py
-app/core/{process,settings,ffprobe,tv_rules,pipeline,capabilities,queue,worker,system_tweaks}.py
-app/ui/{theme,dialogs,main_window,encoding_window,log_view}.py
-app/ui/widgets/common.py
-app/ui/pages/{dashboard,fixer,tools}.py
-assets/{fonts,icons,legacy_fa.json}
-tests/                         # pure rules, commands, subprocess safety, real encodes, Qt smoke
-EdiusBooster.spec
-```
+Project layout: `main.py`, `app/core/` (probe, pipeline, TV rules, worker, queue, safety, system tweaks), `app/ui/` (widgets, pages, logs, Encoding), `assets/`, `tests/`, `EdiusBooster.spec`.

@@ -225,20 +225,30 @@ class SystemTweaks:
             if os.name != 'nt':
                 continue
             try:
+                if not (self.thermal or self.priority_guard):
+                    self.was_hot = False
+                    continue
                 hot = self.thermal and (cpu_temperature() or 0) > (self.threshold - 5 if self.was_hot else self.threshold)
+                if self.stop_event.is_set() or not (self.thermal or self.priority_guard):
+                    continue
                 just_cooled = self.was_hot and not hot
                 self.was_hot = hot
                 if not self.priority_guard and not hot and not just_cooled:
                     continue
                 for proc in psutil.process_iter(['pid', 'name']):
-                    if (proc.info['name'] or '').lower() in ('edius.exe', 'ffmpeg.exe'):
+                    name = (proc.info['name'] or '').lower()
+                    if name == 'ffmpeg.exe' and not (hot or just_cooled):
+                        continue  # Never escalate normal FFmpeg or journal every preview process.
+                    if name in ('edius.exe', 'ffmpeg.exe'):
                         with self.lock:
+                            if self.stop_event.is_set() or not (self.thermal or self.priority_guard):
+                                continue
                             originals = self.state.get('priorities', [])
                             if not any(entry[0] == proc.pid and entry[1] == proc.create_time() for entry in originals):
                                 originals.append([proc.pid, proc.create_time(), proc.nice()])
                                 self.journal('priorities', originals)
-                        original = next((entry[2] for entry in originals if entry[0] == proc.pid and entry[1] == proc.create_time()), proc.nice())
-                        proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if hot else
-                                  psutil.HIGH_PRIORITY_CLASS if self.priority_guard else original)
+                            original = next((entry[2] for entry in originals if entry[0] == proc.pid and entry[1] == proc.create_time()), proc.nice())
+                            proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if hot else
+                                  psutil.HIGH_PRIORITY_CLASS if self.priority_guard and (proc.info['name'] or '').lower() == 'edius.exe' else original)
             except (psutil.Error, OSError):
                 pass

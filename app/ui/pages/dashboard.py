@@ -72,7 +72,7 @@ class Dashboard(QWidget):
         self.queue_table.setRowCount(len(filtered))
         for i, job in enumerate(filtered):
             self.queue_table.setItem(i, 0, QTableWidgetItem(job.source.name))
-            self.queue_table.setItem(i, 1, QTableWidgetItem(f'{tr(job.status)}  {job.data.get("progress", 0):.0f}%'))
+            self.queue_table.setItem(i, 1, QTableWidgetItem(f'{tr(job.status)}: {job.data.get("reason","")}  {job.data.get("progress", 0):.0f}%'))
         done = [j for j in jobs if j.status in ('TV-Safe ✓', 'Done') and j.data.get('output')]
         size = sum(j.data.get('size', 0) for j in done)
         self.converted.setText(f'{size / 1e9:.2f} GB')

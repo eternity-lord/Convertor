@@ -90,7 +90,7 @@ class TweaksPage(QWidget):
         values = [
             ('power', 'Performance power plan', 'Clone the current plan; AC CPU min/max 100%. Original plan stays untouched.'),
             ('parking', 'Disable core parking', 'Unpark AC-powered CPU cores in a temporary power plan.'),
-            ('priority', 'Priority guard', 'Keep EDIUS and FFmpeg at high priority; restore original values.'),
+            ('priority', 'Priority guard', 'Opt-in EDIUS priority only. FFmpeg priority is controlled by Settings → High priority; originals are restored.'),
             ('thermal', 'Thermal guard', 'Reduce encode concurrency and process priority above 85°C. Sensors may be unavailable.'),
             ('timer', '1 ms timer resolution', 'Request fine-grained Windows scheduling until exit.'),
             ('visual', 'Reduce visual effects', 'Temporarily select Windows performance visual settings.'),
@@ -132,6 +132,7 @@ class SettingsPage(QWidget):
     reprobe = Signal()
     concurrency_changed = Signal(int)
     monitor_requested = Signal()
+    execution_changed = Signal(bool, bool)
 
     def __init__(self, settings):
         super().__init__()
@@ -142,7 +143,7 @@ class SettingsPage(QWidget):
         self.lang.currentIndexChanged.connect(lambda _: self.language_changed.emit('fa' if selected(self.lang) == 'فارسی' else 'en'))
         form = QFormLayout()
         form.addRow('Language / زبان', self.lang)
-        self.parallel = combo(['Auto', '1', '2', '3', '4'], settings.get('parallel','Auto'))
+        self.parallel = combo(['1', '2', '3'], str(settings.get('parallel','1')))
         self.parallel.currentIndexChanged.connect(self.change_parallel)
         form.addRow('Parallel jobs', self.parallel)
         self.scratch = QLineEdit(settings.get('scratch',''))
@@ -152,7 +153,20 @@ class SettingsPage(QWidget):
         scratch_row.setLayout(layout)
         form.addRow('NVMe / RAM disk scratch', scratch_row)
         card.box.addLayout(form)
-        card.box.addWidget(label('Auto: 2 on Intel QSV, 1 on CPU. Low RAM or high temperature reduces concurrency. No unsafe working-set trimming.', 'muted'))
+        self.safe = Toggle('Safe mode', settings.get('safe_mode',True))
+        self.performance = Toggle('Performance mode', not settings.get('safe_mode',True))
+        self.high_priority = Toggle('High priority (opt-in)', settings.get('high_priority',False))
+        self.safe.toggled.connect(self.safe_changed)
+        self.performance.toggled.connect(lambda value:self.safe.setChecked(not value))
+        self.high_priority.toggled.connect(lambda _:self.execution_changed_now())
+        card.box.addLayout(row(self.safe,self.performance))
+        card.box.addWidget(self.high_priority)
+        card.box.addWidget(label('Default: one job, NORMAL priority, leave two logical cores free, 16 GPU upload frames. Free RAM <3 GB forces one job. Sustained RAM >90% / CPU >95% pauses the queue after 10 seconds in either mode.', 'muted'))
+        self.warning = label('Warning: 2–3 jobs, High priority or Performance mode can make the PC unresponsive. Changes apply to newly started jobs. Performance mode uses all encoder threads; resource guards remain enabled.', 'muted')
+        self.warning.setStyleSheet('color:#e8c278;')
+        card.box.addWidget(self.warning)
+        self.update_warning()
+
         card.box.addLayout(row(button('Save settings', lambda: settings.set('scratch',self.scratch.text())),
                                 button('Re-probe hardware', self.reprobe.emit)))
         card.box.addLayout(row(button('Restart as administrator', self.admin), button('Show monitor', self.monitor_requested.emit)))
@@ -169,7 +183,24 @@ class SettingsPage(QWidget):
     def change_parallel(self):
         value = selected(self.parallel)
         self.settings.set('parallel',value)
-        self.concurrency_changed.emit(0 if value == 'Auto' else int(value))
+        self.concurrency_changed.emit(int(value))
+        self.update_warning()
+
+    def safe_changed(self, value):
+        self.performance.blockSignals(True)
+        self.performance.setChecked(not value)
+        self.performance.blockSignals(False)
+        self.execution_changed_now()
+
+    def execution_changed_now(self):
+        self.settings.set('safe_mode',self.safe.isChecked())
+        self.settings.set('high_priority',self.high_priority.isChecked())
+        self.execution_changed.emit(self.safe.isChecked(),self.high_priority.isChecked())
+        self.update_warning()
+
+    def update_warning(self):
+        self.warning.setVisible(int(selected(self.parallel) or '1') > 1 or
+                                not self.safe.isChecked() or self.high_priority.isChecked())
 
     def admin(self):
         if elevate():

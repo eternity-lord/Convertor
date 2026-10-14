@@ -95,7 +95,7 @@ def test_audio_offset_preserved_and_synced(tmp_path):
     assert not verify(result,plan.target)
 
 
-def test_full_file_verification_bounded_heap(tmp_path):
+def test_sampled_output_verification(tmp_path):
     from app.core.ffprobe import verify_probe
     src=tmp_path/'source.mp4';source(src,'30000/1001',duration=5)
     out=tmp_path/'output.mp4'
@@ -164,3 +164,120 @@ def test_live_process_controls(tmp_path,monkeypatch,action):
         if thread.is_alive():
             worker.stop()
             thread.join(timeout=5)
+
+
+@pytest.mark.parametrize('violation',['Audio must be AAC-LC, ≤2 channels, 48 kHz', 'Unexpected output dimensions'])
+def test_verifier_warning_retains_output_and_original(tmp_path,monkeypatch,violation):
+    src=tmp_path/'warning.mp4';source(src)
+    opts=Options(output_mode='Same folder',delete_source=True)
+    job=Job(src,opts);events=[]
+    worker=EncodeWorker(job,opts,{},lambda identity,data:events.append(data))
+    original=worker._inspect
+    def warned(path,plan,options):
+        media,violations,values=original(path,plan,options)
+        return media,violations+[violation],values
+    monkeypatch.setattr(worker,'_inspect',warned)
+    worker.run()
+    final=events[-1]
+    assert final['status']=='Warning',events
+    assert violation in final['reason']
+    assert Path(final['output']).exists() and src.exists()
+    assert not any(e.get('status')=='Failed' for e in events)
+    assert 'exact FFmpeg command' in final['details'] and 'Stderr tail' in final['details']
+    assert 'OUTPUT ffprobe values' in final['details'] and 'sample_rate' in final['details']
+    assert not list(tmp_path.glob('*.part.mp4'))
+
+
+def test_bf_zero_retry_failure_retains_first_successful_encode(tmp_path,monkeypatch):
+    from app.core.worker import EncodeFailure
+    src=tmp_path/'timing.mp4';source(src)
+    opts=Options(output_mode='Same folder',delete_source=True)
+    job=Job(src,opts);events=[]
+    worker=EncodeWorker(job,opts,{},lambda identity,data:events.append(data))
+    original_inspect=worker._inspect;original_encode=worker._encode;calls=[]
+    def inspect(path,plan,options):
+        media,violations,values=original_inspect(path,plan,options)
+        return media,violations+['Audio/video start offset 0.100000s ≥40 ms'],values
+    def encode(plan):
+        calls.append(plan.command)
+        if len(calls)==2:
+            assert plan.command[plan.command.index('-bf')+1]=='0'
+            raise EncodeFailure('FFmpeg exited with code 1: synthetic retry error')
+        original_encode(plan)
+    monkeypatch.setattr(worker,'_inspect',inspect)
+    monkeypatch.setattr(worker,'_encode',encode)
+    worker.run()
+    assert len(calls)==2
+    final=events[-1]
+    assert final['status']=='Warning' and 'first encoded output retained' in final['reason']
+    assert Path(final['output']).is_file() and src.is_file()
+    assert not list(tmp_path.glob('*.part.mp4'))
+
+
+def test_output_probe_timeout_is_warning_not_encoder_failure(tmp_path,monkeypatch):
+    from app.core.process import ToolTimeout
+    import app.core.worker as module
+    src=tmp_path/'probe_timeout.mp4';source(src)
+    opts=Options(output_mode='Same folder',delete_source=True)
+    job=Job(src,opts);events=[]
+    def timeout(*args,**kwargs):raise ToolTimeout('ffprobe timed out after 15s')
+    monkeypatch.setattr(module,'verify_probe',timeout)
+    EncodeWorker(job,opts,{},lambda identity,data:events.append(data)).run()
+    assert events[-1]['status']=='Warning'
+    assert '15s' in events[-1]['reason']
+    assert Path(events[-1]['output']).exists() and src.exists()
+
+
+def test_no_output_is_failed_with_real_reason(tmp_path,monkeypatch):
+    src=tmp_path/'nooutput.mp4';source(src)
+    opts=Options(output_mode='Same folder');job=Job(src,opts);events=[]
+    worker=EncodeWorker(job,opts,{},lambda identity,data:events.append(data))
+    monkeypatch.setattr(worker,'_encode',lambda plan:None)
+    worker.run()
+    assert events[-1]['status']=='Failed'
+    assert 'no output file' in events[-1]['reason']
+    assert src.exists()
+
+
+@pytest.mark.parametrize('codec,sample_rate', [('aac','96000'),('ac3','48000')])
+def test_actual_1080p5994_unsafe_audio_round1(tmp_path,codec,sample_rate):
+    import time
+    label='Khanum' if codec=='aac' else 'Agha'
+    src=tmp_path/f'synthetic_{label}_1080p5994.mp4'
+    capture(['ffmpeg','-v','error','-y','-f','lavfi','-i',
+             'color=c=0x315445:size=1920x1080:rate=60000/1001:duration=2.002',
+             '-f','lavfi','-i',f'anullsrc=r={sample_rate}:cl=5.1',
+             '-t','2.002','-c:v','libx264','-preset','ultrafast','-threads','2',
+             '-pix_fmt','yuv420p','-c:a',codec,'-b:a','384k',str(src)],timeout=30)
+    begin=time.monotonic();media=probe(src);analysis_seconds=time.monotonic()-begin
+    assert media.video['width']==1920 and media.fps==rate('59.94')
+    assert media.audio[0]['channels']==6
+    opts=Options(audio='Copy',output_mode='Same folder')
+    job=Job(src,opts);job.media=media;events=[]
+    EncodeWorker(job,opts,{},lambda identity,data:events.append(data)).run()
+    final=events[-1]
+    assert final['status']=='TV-Safe ✓',final
+    output=probe(final['output'])
+    assert output.video['level']==42
+    assert rate(output.video['r_frame_rate'])==rate(output.video['avg_frame_rate'])==rate('59.94')
+    assert output.audio[0]['codec_name']=='aac' and output.audio[0]['profile']=='LC'
+    assert output.audio[0]['channels']==2 and output.audio[0]['sample_rate']=='48000'
+    assert not verify(output)
+    assert analysis_seconds < 15
+
+
+def test_skipped_stream_analysis_still_encodes_and_keeps_warning(tmp_path):
+    from app.core.ffprobe import unverified_media
+    src=tmp_path/'unknown.mp4';source(src)
+    opts=Options(fps='59.94',output_mode='Same folder',delete_source=True)
+    job=Job(src,opts)
+    job.media=unverified_media(src,'Streams timed out after 15s','59.94')
+    events=[]
+    EncodeWorker(job,opts,{},lambda identity,data:events.append(data)).run()
+    final=events[-1]
+    assert final['status']=='Warning',events
+    assert Path(final['output']).exists() and src.exists()
+    out=probe(final['output'])
+    assert out.video['width']==320  # Unknown metadata must not trigger expensive upscaling.
+    assert out.video['avg_frame_rate']=='60000/1001'
+    assert out.audio[0]['codec_name']=='aac' and out.audio[0]['sample_rate']=='48000'

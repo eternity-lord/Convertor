@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -15,6 +16,14 @@ PROCESS_LOCK = threading.Lock()
 
 
 class ToolError(RuntimeError):
+    pass
+
+
+class ToolTimeout(ToolError):
+    pass
+
+
+class ProbeSkipped(ToolError):
     pass
 
 
@@ -36,9 +45,9 @@ def tool(name):
 def spawn(command, priority=False):
     flags = 0
     if os.name == 'nt':
-        flags = subprocess.CREATE_NO_WINDOW
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.NORMAL_PRIORITY_CLASS
         if priority:
-            flags |= subprocess.HIGH_PRIORITY_CLASS
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.HIGH_PRIORITY_CLASS
     process = subprocess.Popen([str(x) for x in command], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             text=True, encoding='utf-8', errors='replace',
@@ -70,7 +79,7 @@ def terminate_tree(process):
             process.kill()
 
 
-def capture(command, timeout=30, limit=2_000_000):
+def capture(command, timeout=30, limit=2_000_000, cancel=None):
     """Drain both pipes concurrently; cap captured text and kill hung probes."""
     process = spawn(command)
     chunks, errors = [], deque(maxlen=160)
@@ -98,10 +107,19 @@ def capture(command, timeout=30, limit=2_000_000):
     for thread in threads:
         thread.start()
     try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        terminate_tree(process)
-        raise ToolError(f'Tool timed out after {timeout}s') from exc
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if cancel is not None and cancel.is_set():
+                terminate_tree(process)
+                raise ProbeSkipped('Analysis skipped by user')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_tree(process)
+                raise ToolTimeout(f'Tool timed out after {timeout}s')
+            try:
+                process.wait(timeout=min(.05, remaining))
+            except subprocess.TimeoutExpired:
+                continue
     finally:
         for thread in threads:
             thread.join(timeout=3)

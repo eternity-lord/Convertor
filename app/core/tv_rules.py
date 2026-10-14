@@ -9,7 +9,7 @@ LEVELS = [('3.0', 1620, 40500), ('3.1', 3600, 108000), ('3.2', 5120, 216000),
           ('4.0', 8192, 245760), ('4.1', 8192, 245760), ('4.2', 8704, 522240),
           ('5.0', 22080, 589824), ('5.1', 36864, 983040), ('5.2', 36864, 2073600)]
 PRESETS = {
-    'Universal TV': (1920, 1080, 30, 20, 'high', 192),
+    'Universal TV': (1920, 1080, 60, 20, 'high', 192),
     'Old TV / USB 720p': (1280, 720, 30, 8, 'main', 128),
     'Samsung / LG / Sony': (1920, 1080, 60, 20, 'high', 192),
     '4K TV': (3840, 2160, 30, 40, 'high', 256),
@@ -17,7 +17,7 @@ PRESETS = {
     'Custom': (3840, 2160, 60, 40, 'high', 192),
 }
 DESCRIPTIONS = {
-    'Universal TV': 'Maximum compatibility · up to 1080p30 · H.264 High · AAC stereo',
+    'Universal TV': 'AVC compatibility · preserve source cadence up to 1080p60 · H.264 High · AAC stereo',
     'Old TV / USB 720p': 'Older USB players · 720p30 · Main · 8 Mbps maximum',
     'Samsung / LG / Sony': 'Modern webOS, Tizen and Android TV · up to 1080p60',
     '4K TV': 'H.264 High · 2160p30 · 40 Mbps maximum',
@@ -55,6 +55,9 @@ class Options:
     codec: str = 'h264_qsv'
     encoder_preset: str = 'medium'
     advanced: dict = field(default_factory=dict)
+    safe_mode: bool = True
+    high_priority: bool = False
+    bframes: int = 2
 
 
 def auto_level(width, height, fps):
@@ -82,7 +85,8 @@ class Target:
 
 
 def choose_target(media, options):
-    pw, ph, cap, max_mbps, profile, audio = PRESETS[options.preset]
+    pw, ph, cap, max_mbps, profile, _ = PRESETS[options.preset]
+    audio = 192
     notes = []
     fps = media.fps if options.fps == 'Auto' else rate(options.fps)
     if not fps or fps > 120:
@@ -158,8 +162,13 @@ def verify(media, target=None, allow_all_audio=False, expected_codec='h264'):
         errors.append('Frame rate is not the selected clean CFR')
     if not media.cadence.samples:
         errors.append('Not enough timestamps to verify cadence')
-    if media.cadence.negative:
-        errors.append('Negative video timestamps')
+    if not media.metadata_verified:
+        errors.append('Unverified: output stream metadata unavailable')
+    if not media.cadence.verified:
+        errors.append('Unverified: ' + media.cadence.issue)
+    video_start = float(v.get('start_time') or 0)
+    if video_start < -.1:
+        errors.append(f'Video start_time {video_start:.6f}s is below -0.1s')
     required = auto_level(width, height, nominal or 25)
     required_level = round(float(required) * (30 if expected_codec == 'hevc' else 10))
     if expected_codec != 'av1' and int(v.get('level', 0)) < required_level:
@@ -176,12 +185,13 @@ def verify(media, target=None, allow_all_audio=False, expected_codec='h264'):
         errors.append('More than one audio stream')
     for a in media.audio:
         if (a.get('codec_name') != 'aac' or a.get('profile') != 'LC'
-                or int(a.get('sample_rate', 0)) != 48000 or int(a.get('channels', 0)) > 2):
+                or int(a.get('sample_rate', 0)) != 48000 or not 1 <= int(a.get('channels', 0)) <= 2):
             errors.append('Audio must be AAC-LC, ≤2 channels, 48 kHz')
         if abs(float(a.get('duration') or 0) - media.duration) >= .040:
             errors.append('Audio/video duration drift ≥40 ms')
-        if float(a.get('start_time') or 0) < -.000001:
-            errors.append('Negative audio timestamps')
+        audio_start = float(a.get('start_time') or 0)
+        if abs(video_start - audio_start) >= .04:
+            errors.append(f'Audio/video start offset {abs(video_start - audio_start):.6f}s ≥40 ms')
     if target:
         if width != target.width or height != target.height:
             errors.append('Unexpected output dimensions')

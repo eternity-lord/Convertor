@@ -104,7 +104,82 @@ def test_real_gui_queue_flow(tmp_path,monkeypatch):
     assert len(w.manager.jobs)==1
     assert w.manager.jobs[0].status=='TV-Safe ✓',w.manager.jobs[0].data
     assert w.encoding.isVisible()
+    assert w.encoding.current().status=='TV-Safe ✓'
     assert w.daily['files']==1
     assert (root/'_TV'/'test_TV.mp4').exists()
     close_window(w)
     app.processEvents()
+
+
+def test_safety_defaults_modes_and_auto_pause(tmp_path,monkeypatch):
+    from app.core.queue import QueueManager
+    monkeypatch.setenv('APPDATA',str(tmp_path))
+    app=QApplication.instance() or QApplication([])
+    settings=Settings();settings.set('parallel','4')  # Migration must not retain unsafe old defaults.
+    monkeypatch.setattr(MainWindow,'probe_hardware',lambda *a:None)
+    window=MainWindow(settings)
+    assert window.manager.limit==1 and window.manager.safe_mode
+    assert not window.manager.high_priority
+    page=window.settings_page
+    assert page.safe.isChecked() and not page.performance.isChecked()
+    page.performance.setChecked(True)
+    assert not page.safe.isChecked() and not window.manager.safe_mode
+    page.safe.setChecked(True)
+    assert window.manager.safe_mode and not page.performance.isChecked()
+    window.manager.running=True
+    alerts=[];window.manager.safety_alert.connect(alerts.append)
+    window.manager.observe_resources(91,30,now=0)
+    window.manager.observe_resources(91,30,now=10)
+    assert window.manager.paused and len(alerts)==1
+    window.encoding.toggle_pause()
+    assert not window.manager.paused
+    close_window(window)
+
+
+def test_low_ram_forces_single_job(tmp_path,monkeypatch):
+    from app.core.queue import QueueManager,Job
+    from app.core.worker import EncodeWorker
+    from app.core.tv_rules import Options
+    from tests_support import sample_media
+    import psutil,threading
+    from types import SimpleNamespace
+    app=QApplication.instance() or QApplication([])
+    manager=QueueManager();manager.limit=3;manager.running=True
+    manager.jobs=[Job(tmp_path/f'{i}.mp4',Options()) for i in range(3)]
+    for job in manager.jobs:job.media=sample_media(job.source)
+    monkeypatch.setattr(psutil,'virtual_memory',lambda:SimpleNamespace(available=2*1024**3,percent=70))
+    gate=threading.Event()
+    monkeypatch.setattr(EncodeWorker,'run',lambda self:gate.wait(timeout=2))
+    logs=[];manager.log.connect(lambda level,message,file,details:logs.append(message))
+    manager.tick()
+    assert sum(job.thread is not None for job in manager.jobs)==1
+    assert any('below 3 GB' in message for message in logs)
+    gate.set()
+    for job in manager.jobs:
+        if job.thread:job.thread.join(timeout=2)
+    manager.stop_all()
+
+
+def test_slow_temperature_sensor_does_not_delay_resource_guard(tmp_path,monkeypatch):
+    import app.ui.main_window as module
+    import threading
+    monkeypatch.setenv('APPDATA',str(tmp_path))
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow,'probe_hardware',lambda *a:None)
+    gate=threading.Event()
+    def stalled_temperature():
+        gate.wait(timeout=2)
+        return None
+    monkeypatch.setattr(module,'cpu_temperature',stalled_temperature)
+    window=MainWindow(Settings());window.timer.stop()
+    loop=QEventLoop()
+    window.metrics_ready.connect(loop.quit)
+    QTimer.singleShot(600,loop.quit)
+    window.poll_metrics()
+    try:
+        loop.exec()
+        assert window.last_metrics and not window.metric_busy
+        assert window.temperature_busy  # CPU/RAM arrived while temperature was still blocked.
+    finally:
+        gate.set()
+        close_window(window)
