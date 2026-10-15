@@ -243,7 +243,10 @@ class MainWindow(GlassWindow):
         ready = caps.get('codecs',{}).get('h264_qsv',{}).get('available',False)
         self.cap_badge.setText('QSV ready ✓' if ready else 'CPU fallback')
         text = caps.get('error') or caps.get('adapter','') + '\n' + '\n'.join(
-            f'{codec}: {"ready" if values["available"] else "unavailable"}' for codec,values in caps.get('codecs',{}).items())
+            f'{codec}: {"ready" if values["available"] else "unavailable: " + values.get("reason", "self-test failed")}' for codec,values in caps.get('codecs',{}).items())
+        text += '\nQSV device: ' + (caps.get('qsv_device') or 'unavailable')
+        text += '\n' + ('Haswell: H.264 encode only · 8-bit NV12 · no low_power' if caps.get('haswell') else '8-bit NV12 output')
+        text += '\n' + '\n'.join(f'{codec}: ICQ {"supported" if values.get("icq") else "unsupported (VBR)"}' for codec, values in caps.get('codecs', {}).items() if values.get('available'))
         self.settings_page.capabilities.setText(text)
         self.advanced.apply_caps(caps)
         self.fixer.hevc.setEnabled(caps.get('codecs',{}).get('hevc_qsv',{}).get('available',False))

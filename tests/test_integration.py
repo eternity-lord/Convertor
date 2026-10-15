@@ -77,6 +77,9 @@ def test_one_retry_on_qsv_failure(tmp_path):
                         lambda identity,data: events.append(data))
     worker.run()
     assert any('CPU maximum compatibility' in e.get('warning','') for e in events)
+    statuses = [e['encoding_status'] for e in events if 'encoding_status' in e]
+    assert statuses[0].startswith('Using QSV')
+    assert any(s.startswith('CPU fallback:') and 'encode failed' in s for s in statuses)
     assert any(e.get('status')=='TV-Safe ✓' for e in events),events
 
 
@@ -127,7 +130,8 @@ def test_interlaced_keep_and_deinterlace(tmp_path):
 def test_live_process_controls(tmp_path,monkeypatch,action):
     import threading
     import app.core.worker as module
-    src=tmp_path/'live.mp4';source(src)
+    # Leave headroom beyond x264's lookahead so first progress is not an EOF race.
+    src=tmp_path/'live.mp4';source(src,duration=6)
     opts=Options(output_mode='Same folder')
     job=Job(src,opts)
     progress=threading.Event()

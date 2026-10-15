@@ -70,7 +70,8 @@ class FixerPage(QWidget):
         self.field(form, 'Profile', 'profile', combo(['baseline', 'main', 'high'], opts.profile))
         self.controls['profile'].setToolTip('TV mode disables High10 / High422 / High444: only 8-bit 4:2:0 is safe.')
         self.field(form, 'Level', 'level', combo(['Auto', '3.0', '3.1', '3.2', '4.0', '4.1', '4.2', '5.0', '5.1', '5.2'], opts.level))
-        self.field(form, 'Rate control', 'rc', combo(['VBR', 'CBR', 'CQP'], opts.rc))
+        self.field(form, 'Rate control', 'rc', combo(['VBR', 'CBR', 'Quality'], 'Quality' if opts.rc in ('CQP', 'ICQ') else opts.rc))
+        self.controls['rc'].setToolTip('Quality uses tested ICQ; if unsupported, uses explicit VBR with the selected bitrate/maxrate/buffer. Software uses CRF.')
         for title, key in [('Bitrate (Mbps)', 'bitrate'), ('Maxrate (Mbps)', 'maxrate'), ('Buffer (Mbps)', 'bufsize')]:
             spin = QDoubleSpinBox()
             spin.setRange(.1, 100)

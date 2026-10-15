@@ -61,7 +61,7 @@ class EncodeWorker:
 
     def _encode(self, plan):
         self.emit(self.job.id, {'status': 'Encoding', 'command': plan.command,
-                               'pipeline': plan.pipeline, 'target': plan.target})
+                               'pipeline': plan.pipeline, 'encoding_status': plan.encoding_status, 'target': plan.target})
         try:
             self.process = spawn(plan.command, priority=self.options.high_priority)
         except OSError as exc:
@@ -140,6 +140,7 @@ class EncodeWorker:
         for index, attempt in enumerate(attempts, 1):
             blocks.append(f'Attempt {index} — exact FFmpeg command:\n' +
                           subprocess.list2cmdline(attempt['command']) +
+                          '\n\n' + attempt.get('encoding_status', '') +
                           '\n\nStderr tail:\n' + attempt['stderr'] +
                           '\n\nOUTPUT ffprobe values:\n' +
                           json.dumps(attempt['probe'], ensure_ascii=False, indent=2))
@@ -196,6 +197,7 @@ class EncodeWorker:
             folder.mkdir(parents=True, exist_ok=True)
             self.emit(self.job.id, {'output':str(destination)})
             options = self.options
+            fallback_reason = ''
             for attempt in range(2):
                 # Keep the first successful encode intact while trying a timing repair.
                 temporary = folder / f'{destination.stem}.{uuid.uuid4().hex[:8]}.part.mp4'
@@ -203,9 +205,11 @@ class EncodeWorker:
                 if attempt:
                     options = replace(options, audio='TV-safe', advanced={}, bframes=0)
                 plan = build_command(media, options, temporary, self.capabilities, software=attempt > 0)
+                if attempt and fallback_reason:
+                    plan.encoding_status = 'CPU fallback: ' + fallback_reason
                 if estimate_bytes(media.duration, plan.target) > 3.9e9:
                     self.emit(self.job.id, {'warning':'Estimated output exceeds FAT32 3.9 GB; use exFAT/NTFS or select split.'})
-                record = {'command':plan.command, 'stderr':'', 'probe':{'not_run':True}}
+                record = {'command':plan.command, 'encoding_status':plan.encoding_status, 'stderr':'', 'probe':{'not_run':True}}
                 attempts.append(record)
                 try:
                     self._encode(plan)
@@ -219,6 +223,7 @@ class EncodeWorker:
                     self.emit(self.job.id, {'warning':str(exc), 'details':self._details(attempts),
                                            'command':plan.command})
                     if attempt == 0:
+                        fallback_reason = f'{plan.pipeline} encode failed: {exc}'
                         self.emit(self.job.id, {'warning':'Retry once: CPU maximum compatibility, -bf 0'})
                         continue
                     if valid is None:
@@ -238,6 +243,7 @@ class EncodeWorker:
                 timing_bad = any(value.startswith(('Video start_time','Audio/video start offset','Audio/video duration drift'))
                                  for value in violations)
                 if timing_bad and attempt == 0:
+                    fallback_reason = 'Output timestamp verification failed: ' + '; '.join(violations)
                     self.emit(self.job.id, {'warning':'Retry once for timestamp alignment with -bf 0; first output preserved'})
                     continue
                 break
@@ -269,7 +275,8 @@ class EncodeWorker:
                       'reason':reason, 'violations':violations, 'errors':[],
                       'output':str(destination), 'parts':parts, 'details':self._details(attempts),
                       'output_probe':probe_values(result) if result else {'error':reason},
-                      'command':plan.command, 'size':destination.stat().st_size})
+                      'command':plan.command, 'pipeline':plan.pipeline,
+                      'encoding_status':plan.encoding_status, 'size':destination.stat().st_size})
             # A warning/unknown analysis can never authorize destructive source deletion.
             if options.delete_source and not violations and media.cadence.verified:
                 self.job.source.unlink()

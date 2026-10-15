@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from .process import tool
 from .safety import encoding_threads
+from .qsv import device_args, is_haswell, can_decode
 from .tv_rules import choose_target, timescale
 
 
@@ -14,6 +15,7 @@ class Plan:
     pipeline: str
     duration: float
     codec: str = 'h264'
+    encoding_status: str = ''
 
 
 def build_command(media, options, output, capabilities=None, software=False, executable=None):
@@ -23,13 +25,14 @@ def build_command(media, options, output, capabilities=None, software=False, exe
     codec = options.codec
     supported = caps.get('codecs', {}).get(codec, {})
     gpu = not software and codec in ('h264_qsv', 'hevc_qsv', 'av1_qsv') and supported.get('available', False)
+    if is_haswell(caps) and codec != 'h264_qsv':
+        gpu = False
+    decode = gpu and can_decode(media, caps)
     output_codec = codec.removesuffix('_qsv') if gpu else 'h264'
     if output_codec != 'h264':
         from dataclasses import replace
         target = replace(target, profile='main', level='5.1' if output_codec == 'hevc' else 'Auto')
-    full = (gpu and caps.get('vpp_qsv') and caps.get('decode', False)
-            and media.video.get('codec_name') in ('h264', 'hevc')
-            and media.video.get('pix_fmt') in ('yuv420p', 'nv12')
+    full = (decode and caps.get('vpp_qsv')
             and options.method == 'Drop / Duplicate'
             and not (media.interlaced and options.double_rate))
     gpu_fps = bool(caps.get('vpp_framerate'))
@@ -39,9 +42,9 @@ def build_command(media, options, output, capabilities=None, software=False, exe
            '-loglevel', 'warning', '-progress', 'pipe:1', '-nostats',
            '-fflags', '+genpts', '-threads', str(encoding_threads(options.safe_mode)), '-filter_threads', '2']
     if gpu:
-        cmd += ['-init_hw_device', 'qsv=hw', '-filter_hw_device', 'hw']
-    if full:
-        cmd += ['-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv',
+        cmd += device_args(caps)
+    if decode:
+        cmd += ['-hwaccel', 'qsv', '-hwaccel_device', 'hw', '-hwaccel_output_format', 'qsv',
                 '-extra_hw_frames', '16' if options.safe_mode else '64']
     cmd += ['-i', str(media.path)]
     if not media.audio:
@@ -61,7 +64,7 @@ def build_command(media, options, output, capabilities=None, software=False, exe
                 vpp += ':deinterlace=1'
         filters.append(vpp)
     if not full:
-        filters = ['setpts=PTS-STARTPTS']
+        filters = (['hwdownload', 'format=nv12'] if decode else []) + ['setpts=PTS-STARTPTS']
         if media.interlaced and options.deinterlace:
             filters += ['bwdif=mode=' + ('send_field' if options.double_rate else 'send_frame') + ':parity=auto:deint=all']
         scaling = f'scale={target.width}:{target.height}:flags=bicubic' + (':interl=1' if keep_interlace else '')
@@ -77,7 +80,7 @@ def build_command(media, options, output, capabilities=None, software=False, exe
         elif options.method == 'Motion interpolation' and not duplication:
             filters += [f'minterpolate=fps={fps}:mi_mode=mci']
         filters += [f'fps=fps={fps}:round=near']
-        filters += ['format=nv12', 'hwupload=extra_hw_frames=16' if options.safe_mode else 'hwupload=extra_hw_frames=64'] if gpu else ['format=yuv420p']
+        filters += ['format=nv12', 'hwupload=extra_hw_frames=16'] if gpu else ['format=yuv420p']
     else:
         filters.append('setsar=1')
     # Finite output length, integral number of frames. AAC is padded/trimmed to the same timeline.
@@ -87,21 +90,25 @@ def build_command(media, options, output, capabilities=None, software=False, exe
             '-profile:v', target.profile, '-level:v', target.level,
             '-fps_mode', 'cfr', '-r', fps, '-g', str(round(float(target.fps) * 2)),
             '-bf', '0' if target.profile == 'baseline' else str(options.bframes), '-refs', '3',
-            '-flags', '+cgop+ilme+ildct' if keep_interlace else '+cgop',
-            '-b:v', f'{target.bitrate:.4f}M', '-maxrate', f'{target.maxrate:.4f}M',
-            '-bufsize', f'{target.bufsize:.4f}M']
+            '-flags', '+cgop+ilme+ildct' if keep_interlace else '+cgop']
+    quality_mode = options.rc in ('CQP', 'ICQ', 'Quality')
+    icq = gpu and quality_mode and supported.get('icq', False)
+    if icq:
+        cmd += ['-global_quality', str(options.quality), '-look_ahead', '0']
+    else:
+        cmd += ['-b:v', f'{target.bitrate:.4f}M', '-maxrate', f'{target.maxrate:.4f}M',
+                '-bufsize', f'{target.bufsize:.4f}M']
     if keep_interlace:
         cmd += ['-top', '1' if top_first else '0']
     if options.rc == 'CBR':
         cmd += ['-minrate', f'{target.bitrate:.4f}M', '-maxrate', f'{target.bitrate:.4f}M']
-    elif options.rc == 'CQP':
-        # CRF/ICQ still has the TV VBV ceiling; unconstrained CQP is not TV-safe.
-        cmd += ['-global_quality' if gpu else '-crf', str(options.quality)]
+    elif quality_mode and not gpu:
+        cmd += ['-crf', str(options.quality)]
     if gpu:
-        cmd += ['-async_depth', '4', '-low_power', str(supported.get('low_power', 0))]
+        cmd += ['-async_depth', '4']
         # Do not pass arbitrary user flags. Only probed options can be enabled.
         for key, val in options.advanced.items():
-            if key in supported.get('tested_options', []):
+            if key in supported.get('tested_options', []) and not (icq and key in ('look_ahead', 'look_ahead_depth')) and key != 'low_power':
                 cmd += [f'-{key}', str(val)]
     else:
         cmd += ['-pix_fmt', 'yuv420p', '-threads', str(encoding_threads(options.safe_mode)), '-x264-params', 'open-gop=0:force-cfr=1']
@@ -131,7 +138,18 @@ def build_command(media, options, output, capabilities=None, software=False, exe
         index = cmd.index('-level:v')
         del cmd[index:index+2]
     cmd += [str(output)]
-    return Plan(cmd, target, 'GPU full' if full else 'Hybrid' if gpu else 'CPU fallback', duration, output_codec)
+    if gpu:
+        status = f'Using QSV · {caps.get("qsv_device") or device_args(caps)[1]} · ' + (
+            'GPU decode' if decode else 'CPU decode → NV12 upload')
+        status += ' · ICQ' if icq else ' · ' + ('CBR' if options.rc == 'CBR' else 'VBR')
+        if quality_mode and not icq:
+            status += ' (ICQ unsupported; explicit VBR bitrate/maxrate/buffer)'
+    else:
+        reason = ('Compatibility retry requested' if software else
+                  'Haswell supports H.264 QSV only' if is_haswell(caps) and codec != 'h264_qsv' else
+                  supported.get('reason') or caps.get('error') or f'{codec} hardware self-test unavailable or failed')
+        status = 'CPU fallback: ' + reason
+    return Plan(cmd, target, 'GPU full' if full else 'Hybrid' if gpu else 'CPU fallback', duration, output_codec, status)
 
 
 def output_path(source, options):

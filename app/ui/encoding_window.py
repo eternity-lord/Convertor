@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QTableWidget, 
 from app.core.queue import ACTIVE, TERMINAL
 from app.core.process import capture, tool
 from app.core.settings import data_dir
+from app.core.qsv import preview_command
 from app.ui.widgets.common import GlassWindow, Card, Chart, Toggle, label, button, row
 from app.ui.pages.fixer import combo, selected
 from app.ui import dialogs
@@ -54,6 +55,7 @@ class QueueTable(QTableWidget):
 
 class EncodingWindow(GlassWindow):
     preview_ready = Signal(object)
+    preview_status = Signal(str, str)
     completion_action = Signal(str)
 
     def __init__(self, manager):
@@ -69,6 +71,8 @@ class EncodingWindow(GlassWindow):
         self.paused = False
         self.explicit_close = False
         self.preview_ready.connect(self.show_preview)
+        self.preview_status.connect(self.report_preview_status)
+        self.preview_messages = {}
         self.content = QWidget()
         layout = QVBoxLayout(self.content)
         layout.setContentsMargins(10, 3, 10, 10)
@@ -217,8 +221,9 @@ class EncodingWindow(GlassWindow):
         d = job.data
         self.current_title.setText(job.source.name)
         self.current_progress.setValue(int(d.get('progress', 0)))
-        self.pipeline.setText(tr('Warning') if job.status == 'Warning' else d.get('pipeline', tr(job.status)))
-        self.pipeline.setToolTip(d.get('reason',''))
+        self.pipeline.setText(d.get('encoding_status', d.get('pipeline', tr(job.status))))
+        self.pipeline.setWordWrap(True)
+        self.pipeline.setToolTip(d.get('encoding_status','') + '\n' + d.get('reason',''))
         self.pipeline.setStyleSheet('color:#e8c278; background:#302715;' if job.status == 'Warning' else '')
         total_frames = round(job.media.duration * float(d['target'].fps)) if job.media and d.get('target') else '?'
         target = d.get('target')
@@ -247,17 +252,35 @@ class EncodingWindow(GlassWindow):
         if job.status == 'Encoding' and now - self.last_preview > 3 and not self.preview_busy:
             self.last_preview = now
             self.preview_busy = True
-            threading.Thread(target=self.grab_preview, args=(job.source, d.get('media_time',0)), daemon=True).start()
+            threading.Thread(target=self.grab_preview, args=(job.id, job.media, dict(self.manager.capabilities), d.get('media_time',0)), daemon=True).start()
 
-    def grab_preview(self, source, timestamp):
+    def report_preview_status(self, identity, message):
+        if self.preview_messages.get(identity) != message:
+            self.preview_messages[identity] = message
+            job = self.manager.find(identity)
+            self.manager.log.emit('WARN' if 'CPU' in message else 'INFO', message,
+                                  job.source.name if job else '', '')
+        self.preview.setToolTip(message)
+
+    def grab_preview(self, identity, media, caps, timestamp):
         path = data_dir() / 'preview.jpg'
         try:
-            capture([tool('ffmpeg'), '-nostdin', '-v', 'error', '-y', '-ss', str(max(0,timestamp)),
-                     '-threads', '1', '-i', str(source), '-frames:v', '1',
-                     '-vf', 'scale=480:-2', '-threads', '1', str(path)], timeout=8)
-            image = QImage(str(path))
-            self.preview_ready.emit(image)
-        except Exception:
+            command, gpu = preview_command(media, caps, timestamp, path, tool('ffmpeg'))
+            status = ('Preview: Using QSV · ' + command[command.index('-init_hw_device') + 1]
+                      if gpu else 'Preview: CPU decode (source codec/pixel format or QSV decode self-test unsupported)')
+            try:
+                capture(command, timeout=8)
+            except Exception as exc:
+                if not gpu:
+                    raise
+                status = 'Preview: CPU fallback after QSV decode failure: ' + str(exc)[-1000:]
+                command, _ = preview_command(media, {}, timestamp, path, tool('ffmpeg'))
+                self.preview_status.emit(identity, status)
+                capture(command, timeout=8)
+            self.preview_status.emit(identity, status)
+            self.preview_ready.emit(QImage(str(path)))
+        except Exception as exc:
+            self.preview_status.emit(identity, 'Preview failed: ' + str(exc)[-1000:])
             self.preview_ready.emit(None)
 
     def show_preview(self, image):

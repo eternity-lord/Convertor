@@ -63,7 +63,7 @@ Logs → Details includes exact commands for both attempts, bounded stderr tails
 
 ## Other features
 
-- Capability-cached one-second QSV encoder / low-power / decode/VPP tests; hardware-resident or CPU-decode/upload pipelines where supported; libx264 fallback.
+- Capability-cached one-second QSV device / encoder / ICQ / decode/VPP tests (no `-low_power`); hardware-resident or CPU-decode/upload pipelines where supported; libx264 fallback.
 - AVC 8-bit 4:2:0 / avc1, safe profiles, even dimensions / square pixels, closed two-second GOP, bounded VBV, limited BT.709/SD tags, AAC stereo and MP4 faststart. Metadata, chapters and extra data/subtitle streams are removed.
 - Recursive AVI/MOV/MKV watch folder: unchanged path, size and modification time for six seconds before enqueue. HEVC/AV1 are hardware-gated and labeled verified / modern-devices-only, not universally TV-safe.
 - Progress / ETA / size prediction, queue ordering, pause/resume, stop/skip, retry, atomic partial-file staging, optional scratch, output collision reservation and folder launchers.
@@ -92,3 +92,29 @@ Build the EXE **on Windows**. The one-folder spec includes fonts/icons and local
 Settings / recovery: `%APPDATA%\EdiusBooster\settings.json`, `restore.json`. Recovery cannot run while the PC is powered off; failed restoration remains journaled for a later attempt. Shutdown/sleep are explicit, are suppressed on warning/error results or watch mode, and shutdown has a 60-second cancellation period (`shutdown /a`).
 
 Project layout: `main.py`, `app/core/` (probe, pipeline, TV rules, worker, queue, safety, system tweaks), `app/ui/` (widgets, pages, logs, Encoding), `assets/`, `tests/`, `EdiusBooster.spec`.
+
+### QSV device selection and Haswell / HD 4600
+
+- Hardware self-tests try `-init_hw_device qsv=hw,child_device_type=dxva2`, then
+  `qsv=hw,child_device_type=d3d11va`, then `qsv=hw`. The **first successful H.264
+  encode** selects the device; it is cached against the FFmpeg binary and probe
+  policy version for seven days. Settings shows the selected device and codec /
+  ICQ results. Use **Re-probe hardware** after changing Intel drivers.
+- Every QSV self-test, Fixer/HQX encode and hardware preview shares that device.
+  Old capability caches are automatically invalidated. No QSV command passes
+  `-low_power`, including optional-control tests.
+- Haswell (including Intel HD 4600) is limited to H.264 QSV encoding with 8-bit
+  NV12. HEVC/AV1 GPU encoding is disabled even if stale capabilities say otherwise.
+  Tested 8-bit H.264 input uses QSV decode on the same device; CPU-only filters
+  download NV12 and re-upload it. Other codecs / 10-bit input use CPU decode,
+  explicit `format=nv12,hwupload=extra_hw_frames=16`, then H.264 QSV encode.
+  Hardware VPP explicitly requests `format=nv12` as well.
+- The Encoding window and Logs show **Using QSV** with device/decode/rate-control,
+  or **CPU fallback** with the self-test / runtime / verification failure reason.
+  Preview decode failures are separately reported in Logs and the preview tooltip.
+- **Quality** replaces the misleading CQP label (saved CQP settings remain
+  compatible). It uses `-global_quality` only after an ICQ hardware test succeeds,
+  with lookahead disabled and no bitrate options that would override ICQ.
+  Otherwise it explicitly uses VBR `-b:v/-maxrate/-bufsize` and reports that
+  substitution. Software quality mode uses CRF. ICQ does not impose a VBR bitrate
+  ceiling; choose VBR or CBR when a strict TV bitrate budget is needed.

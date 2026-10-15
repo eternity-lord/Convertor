@@ -106,6 +106,9 @@ class QueueManager(QObject):
         if command:
             import subprocess
             details = subprocess.list2cmdline(command) + '\n\n' + details
+        if 'encoding_status' in changes:
+            self.log.emit('WARN' if changes['encoding_status'].startswith('CPU fallback') else 'INFO',
+                          changes['encoding_status'], job.source.name, details)
         if 'warning' in changes:
             self.log.emit('WARN', changes['warning'][:1200], job.source.name, details)
         if 'errors' in changes and changes['errors']:
