@@ -8,13 +8,14 @@ from datetime import date
 from PySide6.QtCore import Qt, Signal, QTimer, QByteArray, QUrl
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget, QLineEdit,
-                              QSystemTrayIcon, QMenu, QApplication)
-from app.core.capabilities import probe_capabilities
-from app.core.process import tool, capture, terminate_all
+                              QSystemTrayIcon, QMenu, QApplication, QMessageBox)
+from app.core.capabilities import probe_engine as probe_capabilities
+from app.core.process import tool, capture, terminate_all, configure_tools
 from app.core.queue import QueueManager, FolderWatcher, TERMINAL, MAX_JOBS
 from app.core.system_tweaks import SystemTweaks, cpu_temperature
 from app.ui.widgets.common import GlassWindow, Card, Pills, label, button, row, scroll
 from app.ui.pages.fixer import FixerPage
+from app.ui.pages.hardware import HardwarePage
 from app.ui.pages.dashboard import Dashboard
 from app.ui.pages.tools import AdvancedPage, TweaksPage, SettingsPage, SupportPage
 from app.ui.log_view import LogView
@@ -22,7 +23,7 @@ from app.ui.encoding_window import EncodingWindow
 from app.ui import dialogs
 from app.i18n import tr, set_language
 
-PAGES = ['Dashboard', 'MP4 Profile Fixer', 'HQX Converter', 'QSV Advanced', 'System Tweaks', 'Logs', 'Settings', 'Support']
+PAGES = ['Dashboard', 'MP4 Profile Fixer', 'HQX Converter', 'QSV Advanced', 'Hardware', 'System Tweaks', 'Logs', 'Settings', 'Support']
 
 
 class Monitor(GlassWindow):
@@ -36,6 +37,7 @@ class Monitor(GlassWindow):
 
 class MainWindow(GlassWindow):
     capabilities_ready = Signal(object)
+    hardware_progress = Signal(str)
     scan_ready = Signal(object)
     metrics_ready = Signal(object)
     temperature_ready = Signal(object)
@@ -52,6 +54,10 @@ class MainWindow(GlassWindow):
         if geometry:
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
         self.manager = QueueManager()
+        self.scan_cancel = threading.Event()
+        self.fallback_dialogs = {}
+        self.manager.fallback_needed.connect(self.ask_hardware_fallback)
+        self.sync_hardware_policy()
         # One-time migration: old Auto=two/GPU or explicit four must not carry unsafe defaults.
         if settings.get('safety_policy_version',0) < 1:
             for key,value in {'safe_mode':True,'high_priority':False,'parallel':'1',
@@ -86,6 +92,7 @@ class MainWindow(GlassWindow):
         self.manager.changed.connect(self.queue_changed)
         self.scan_ready.connect(self.scanned)
         self.capabilities_ready.connect(self.set_capabilities)
+        self.hardware_progress.connect(self.show_hardware_progress)
         self.metrics_ready.connect(self.set_metrics)
         self.temperature_ready.connect(self.set_temperature)
         self.tweaks = None
@@ -155,17 +162,23 @@ class MainWindow(GlassWindow):
         self.fixer = FixerPage(self.settings, self.manager)
         self.hqx = FixerPage(self.settings, self.manager, True)
         self.advanced = AdvancedPage(self.settings)
+        self.advanced.preset.currentIndexChanged.connect(lambda _: self.sync_hardware_policy())
+        self.hardware_page = HardwarePage()
+        self.hardware_page.rescan.connect(lambda: self.probe_hardware(True))
+        self.hardware_page.cancel_scan.connect(self.scan_cancel.set)
         self.tweaks_page = TweaksPage()
         self.settings_page = SettingsPage(self.settings)
         self.settings_page.language_changed.connect(self.change_language)
         self.settings_page.reprobe.connect(lambda: self.probe_hardware(True))
         self.settings_page.concurrency_changed.connect(lambda value: setattr(self.manager,'limit',value))
         self.settings_page.execution_changed.connect(self.set_execution_policy)
+        self.settings_page.hardware_policy_changed.connect(self.sync_hardware_policy)
+        self.settings_page.tools_changed.connect(self.apply_tool_paths)
         self.settings_page.monitor_requested.connect(self.monitor.show)
         self.tweaks_page.apply_requested.connect(self.apply_tweaks)
         self.tweaks_page.restore_requested.connect(self.restore_tweaks)
         self.tweaks_page.monitor_requested.connect(self.monitor.show)
-        self.pages = [self.dashboard, self.fixer, self.hqx, self.advanced, self.tweaks_page,
+        self.pages = [self.dashboard, self.fixer, self.hqx, self.advanced, self.hardware_page, self.tweaks_page,
                       self.logs, self.settings_page, SupportPage()]
         for page in self.pages:
             self.stack.addWidget(scroll(page) if page is not self.logs else page)
@@ -182,6 +195,11 @@ class MainWindow(GlassWindow):
         self.navigate('Dashboard')
         self.setLayoutDirection(Qt.RightToLeft if self.settings.get('language') == 'fa' else Qt.LeftToRight)
         self.advanced.apply_caps(self.manager.capabilities)
+        scanning = self.cap_busy
+        if self.manager.capabilities:
+            self.set_capabilities(self.manager.capabilities)
+        self.cap_busy = self.manager.hardware_scanning = scanning
+        self.hardware_page.scanning(scanning)
         self.queue_changed()
 
     def navigate(self, name):
@@ -224,39 +242,125 @@ class MainWindow(GlassWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
 
+    def sync_hardware_policy(self):
+        self.manager.global_hardware = self.settings.get('hardware', 'Auto')
+        old_preset = self.settings.get('encoder_preset', 'medium')
+        self.manager.quality_speed = ('Fast' if old_preset in ('veryfast', 'faster', 'fast') else
+                                      'High Quality' if old_preset == 'slow' else
+                                      'Max Quality' if old_preset in ('slower', 'veryslow') else 'Balanced')
+        self.manager.failure_policy = self.settings.get('failure_policy', 'Use next')
+        self.manager.use_all_gpus = self.settings.get('use_all_gpus', False)
+        if hasattr(self, 'fixer'):
+            self.fixer.apply_hardware_caps(self.manager.capabilities)
+            self.hqx.apply_hardware_caps(self.manager.capabilities)
+
+    def apply_tool_paths(self, ffmpeg, ffprobe):
+        if self.cap_busy or self.manager.running or self.manager.analysis_running:
+            self.logs.append('WARN', 'Stop / finish the queue and hardware scan before changing tools.')
+            return
+        self.settings.set('ffmpeg_path', ffmpeg)
+        self.settings.set('ffprobe_path', ffprobe)
+        self.probe_hardware(True)
+
+    def show_hardware_progress(self, text):
+        self.hardware_page.status.setText(text)
+        self.settings_page.capabilities.setText(text)
+        self.cap_badge.setText('Hardware · testing…')
+
     def probe_hardware(self, force=False):
         if self.cap_busy:
             return
+        if self.manager.running or self.manager.analysis_running:
+            self.logs.append('WARN', 'Stop / finish the queue before re-scanning hardware (probes use GPU sessions).')
+            return
         self.cap_busy = True
+        self.manager.hardware_scanning = True
+        self.scan_cancel.clear()
+        self.hardware_page.scanning(True)
+        paths = (self.settings.get('ffmpeg_path', ''), self.settings.get('ffprobe_path', ''))
         def run():
             try:
-                tool('ffprobe')
-                result = probe_capabilities(force)
+                configure_tools(*paths)
+                version = capture([tool('ffprobe'), '-hide_banner', '-version'], timeout=10, cancel=self.scan_cancel)
+                if 'ffprobe version' not in version:
+                    raise ValueError('Selected FFprobe is not a usable FFprobe executable')
+                result = probe_capabilities(force, self.hardware_progress.emit, self.scan_cancel)
             except Exception as exc:
-                result = {'error':str(exc),'codecs':{}}
+                result = {'error':str(exc), 'codecs':{}}
             self.capabilities_ready.emit(result)
         threading.Thread(target=run, daemon=True).start()
 
     def set_capabilities(self, caps):
         self.cap_busy = False
+        self.manager.hardware_scanning = False
+        self.hardware_page.scanning(False)
+        # Never replace a running job's immutable snapshot of the matrix.
         self.manager.capabilities = caps
-        ready = caps.get('codecs',{}).get('h264_qsv',{}).get('available',False)
-        self.cap_badge.setText('QSV ready ✓' if ready else 'CPU fallback')
-        text = caps.get('error') or caps.get('adapter','') + '\n' + '\n'.join(
-            f'{codec}: {"ready" if values["available"] else "unavailable: " + values.get("reason", "self-test failed")}' for codec,values in caps.get('codecs',{}).items())
-        text += '\nQSV device: ' + (caps.get('qsv_device') or 'unavailable')
-        text += '\n' + ('Haswell: H.264 encode only · 8-bit NV12 · no low_power' if caps.get('haswell') else '8-bit NV12 output')
-        text += '\n' + '\n'.join(f'{codec}: ICQ {"supported" if values.get("icq") else "unsupported (VBR)"}' for codec, values in caps.get('codecs', {}).items() if values.get('available'))
+        matrix = caps.get('matrix')
+        if matrix:
+            from app.core.hardware.matrix import HardwareMatrix
+            parsed = HardwareMatrix.from_dict(matrix)
+            ready = [c for c in parsed.encoders if c.available and c.hardware]
+            inv = parsed.inventory
+            self.cap_badge.setText(f'{len(ready)} HW encoders ✓' if ready else
+                                   'CPU only · tested' if any(c.available for c in parsed.encoders) else 'No usable encoder')
+            text = inv.get('version', 'Unknown FFmpeg') + '\n' + inv.get('ffmpeg', '') + '\n' + inv.get('ffprobe', '')
+            text += '\nBuild flags: ' + ' '.join(inv.get('build_flags', []))
+            text += '\nQSV device: ' + (caps.get('qsv_device') or 'unavailable')
+            text += '\n' + '\n'.join(f'{c.name}: {"✓ tested" if c.available else "✗ " + c.reason[:300]}' for c in parsed.encoders)
+            text += '\nSee Hardware cards for exact tested flags, driver and decode evidence. Unknown limits are not enabled.'
+            available_codecs = {c.codec for c in parsed.encoders if c.available}
+            for page in (self.fixer, self.hqx):
+                page.apply_hardware_caps(caps)
+            control = self.settings_page.hardware
+            control.blockSignals(True)
+            for gpu in parsed.gpus:
+                if gpu.vendor != 'CPU' and any(c.gpu_id == gpu.id for c in parsed.encoders) and control.findData(gpu.id) < 0:
+                    control.addItem(gpu.name + ' [tested runtime slot]', gpu.id)
+            wanted = self.settings.get('hardware', 'Auto')
+            if control.findData(wanted) >= 0:
+                control.setCurrentIndex(control.findData(wanted))
+            control.blockSignals(False)
+            for i in range(control.count()):
+                vendor = control.itemData(i)
+                allowed = vendor == 'Auto' or any(c.available and (c.vendor == vendor or c.gpu_id == vendor) for c in parsed.encoders)
+                control.model().item(i).setEnabled(allowed)
+                control.setItemData(i, '' if allowed else 'No encoder for this vendor passed a test', Qt.ToolTipRole)
+            for i in range(self.hqx.encoder_choice.count()):
+                codec = self.hqx.encoder_choice.itemData(i).split('_')[0]
+                allowed = codec in available_codecs
+                self.hqx.encoder_choice.model().item(i).setEnabled(allowed)
+                self.hqx.encoder_choice.setItemData(i, '' if allowed else 'No tested encoder in active FFmpeg', Qt.ToolTipRole)
+            self.fixer.hevc.setEnabled('hevc' in available_codecs)
+        else:
+            text = caps.get('error', 'Hardware matrix unavailable')
+            self.cap_badge.setText('Hardware scan failed')
+        self.hardware_page.set_matrix(matrix)
         self.settings_page.capabilities.setText(text)
         self.advanced.apply_caps(caps)
-        self.fixer.hevc.setEnabled(caps.get('codecs',{}).get('hevc_qsv',{}).get('available',False))
-        for index in range(self.hqx.encoder_choice.count()):
-            codec = self.hqx.encoder_choice.itemData(index)
-            available = codec == 'h264_qsv' or caps.get('codecs',{}).get(codec,{}).get('available',False)
-            self.hqx.encoder_choice.model().item(index).setEnabled(available)
-        self.logs.append('ERROR' if caps.get('error') else 'INFO',text)
+        self.logs.append('ERROR' if caps.get('error') else 'INFO', text)
         if caps.get('error'):
             self.fixer.detected.setText(text)
+
+    def ask_hardware_fallback(self, identity, request):
+        job = self.manager.find(identity)
+        if not job or not job.worker or self.closing:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle('Hardware fallback · ' + job.source.name)
+        box.setText(request['message'])
+        box.setDetailedText(request['raw'])
+        choices = {}
+        for action in ('Use next', 'Use CPU', 'Stop'):
+            choices[box.addButton(action, QMessageBox.ActionRole if action != 'Stop' else QMessageBox.RejectRole)] = action
+        box.setDefaultButton(next(b for b, action in choices.items() if action == 'Stop'))
+        def answered(*_):
+            job.worker.answer_fallback(choices.get(box.clickedButton(), 'Stop'))
+            self.fallback_dialogs.pop(identity, None)
+            box.deleteLater()
+        box.finished.connect(answered)
+        self.fallback_dialogs[identity] = box
+        box.open()  # Asynchronous; the worker waits on an event, never on the GUI thread.
 
     def scan_folder(self, folder, options, start, page=None):
         if self.scan_busy or self.manager.analysis_running:
@@ -465,6 +569,9 @@ class MainWindow(GlassWindow):
             event.ignore()
             return
         self.closing = True
+        self.scan_cancel.set()
+        for dialog in list(self.fallback_dialogs.values()):
+            dialog.reject()
         self.timer.stop()
         self.manager.stop_all()
         self.hide()

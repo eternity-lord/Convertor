@@ -13,6 +13,19 @@ from pathlib import Path
 
 PROCESSES = weakref.WeakSet()
 PROCESS_LOCK = threading.Lock()
+TOOL_PATHS = {}
+
+
+def configure_tools(ffmpeg="", ffprobe=""):
+    paths = {}
+    for name, value in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe)):
+        if value:
+            path = Path(value).expanduser().resolve()
+            if not path.is_file():
+                raise ToolError(f"{name}: selected executable does not exist: {path}")
+            paths[name] = str(path)
+    TOOL_PATHS.clear()
+    TOOL_PATHS.update(paths)
 
 
 class ToolError(RuntimeError):
@@ -28,6 +41,8 @@ class ProbeSkipped(ToolError):
 
 
 def tool(name):
+    if name in TOOL_PATHS:
+        return TOOL_PATHS[name]
     roots = [Path(sys.executable).parent, Path(__file__).resolve().parents[2]]
     if getattr(sys, '_MEIPASS', None):
         roots.insert(0, Path(sys._MEIPASS))
@@ -79,7 +94,7 @@ def terminate_tree(process):
             process.kill()
 
 
-def capture(command, timeout=30, limit=2_000_000, cancel=None):
+def capture(command, timeout=30, limit=2_000_000, cancel=None, include_stderr=False):
     """Drain both pipes concurrently; cap captured text and kill hung probes."""
     process = spawn(command)
     chunks, errors = [], deque(maxlen=160)
@@ -129,7 +144,7 @@ def capture(command, timeout=30, limit=2_000_000, cancel=None):
         raise ToolError('Probe output exceeded the bounded capture limit')
     if process.returncode:
         raise ToolError(''.join(errors)[-16000:] or 'Tool failed')
-    return ''.join(chunks)
+    return ''.join(chunks) + (''.join(errors)[-16000:] if include_stderr else '')
 
 
 def terminate_all():

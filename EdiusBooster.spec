@@ -9,5 +9,5 @@ a = Analysis(['main.py'], pathex=[str(root)], binaries=binaries,
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='EdiusBooster',
           debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
-          console=False, uac_admin=False)
+          console=False, uac_admin=True)
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='EdiusBooster')

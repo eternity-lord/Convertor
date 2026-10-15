@@ -183,3 +183,50 @@ def test_slow_temperature_sensor_does_not_delay_resource_guard(tmp_path,monkeypa
     finally:
         gate.set()
         close_window(window)
+
+
+def test_hardware_page_matrix_controls_and_language_rebuild(tmp_path, monkeypatch):
+    from hardware_support import matrix
+    from app.ui.pages.fixer import selected
+    monkeypatch.setenv('APPDATA', str(tmp_path))
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, 'probe_hardware', lambda *a: None)
+    window = MainWindow(Settings())
+    data = matrix('Intel', 'NVIDIA', 'CPU').to_dict()
+    caps = dict(matrix=data, codecs={'h264_qsv':{'available':True, 'tested_options':[]}},
+                qsv_device='qsv=hw,child_device_type=dxva2')
+    try:
+        window.set_capabilities(caps)
+        window.navigate('Hardware')
+        app.processEvents()
+        assert window.hardware_page.matrix.encoders[0].available
+        assert 'Build flags' in window.settings_page.capabilities.text()
+        assert 'dxva2' in window.settings_page.capabilities.text()
+        control = window.fixer.controls['hardware']
+        assert not control.model().item(control.findData('AMD')).isEnabled()
+        control.setCurrentIndex(control.findData('NVIDIA'))
+        assert selected(control) == 'NVIDIA'
+        window.change_language('fa')
+        app.processEvents()
+        window.navigate('Hardware')
+        assert window.hardware_page.matrix
+        assert window.manager.safe_mode and window.manager.limit == 1
+    finally:
+        close_window(window)
+
+
+def test_hardware_scan_state_survives_language_rebuild(tmp_path, monkeypatch):
+    from hardware_support import matrix
+    monkeypatch.setenv('APPDATA', str(tmp_path))
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(MainWindow, 'probe_hardware', lambda *a: None)
+    window = MainWindow(Settings())
+    try:
+        window.set_capabilities({'matrix': matrix('CPU').to_dict(), 'codecs':{}})
+        window.cap_busy = window.manager.hardware_scanning = True
+        window.change_language('fa')
+        assert window.cap_busy and window.manager.hardware_scanning
+        assert not window.hardware_page.scan_button.isEnabled()
+        assert window.hardware_page.cancel_button.isEnabled()
+    finally:
+        close_window(window)

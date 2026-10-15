@@ -1,6 +1,6 @@
 import threading
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QFormLayout, QLineEdit, QSpinBox, QComboBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QFormLayout, QLineEdit, QSpinBox, QComboBox, QFileDialog
 from app.ui.widgets.common import Card, Toggle, label, button, row
 from app.ui.pages.fixer import combo, selected
 from app.ui import dialogs
@@ -133,6 +133,8 @@ class SettingsPage(QWidget):
     concurrency_changed = Signal(int)
     monitor_requested = Signal()
     execution_changed = Signal(bool, bool)
+    hardware_policy_changed = Signal()
+    tools_changed = Signal(str, str)
 
     def __init__(self, settings):
         super().__init__()
@@ -146,6 +148,18 @@ class SettingsPage(QWidget):
         self.parallel = combo(['1', '2', '3'], str(settings.get('parallel','1')))
         self.parallel.currentIndexChanged.connect(self.change_parallel)
         form.addRow('Parallel jobs', self.parallel)
+        self.hardware = combo(['Auto', 'Intel', 'NVIDIA', 'AMD', 'CPU'], settings.get('hardware', 'Auto'))
+        self.hardware.setToolTip('Auto uses the fastest tested encoder for the target codec. Per-job selections can override this.')
+        self.failures = combo(['Ask', 'Use next', 'Use CPU', 'Stop'], settings.get('failure_policy', 'Use next'))
+        self.failures.setToolTip('What to do after an actual encode or exact-job preflight failure. Every attempt is logged.')
+        self.all_gpus = Toggle('Use all tested GPUs', settings.get('use_all_gpus', False))
+        self.all_gpus.setToolTip('Distribute queued jobs across tested device slots. Does not raise your global parallel limit. Safe mode allows one job per device.')
+        form.addRow('Hardware', self.hardware)
+        form.addRow('If hardware fails', self.failures)
+        form.addRow('', self.all_gpus)
+        self.hardware.currentIndexChanged.connect(self.hardware_changed)
+        self.failures.currentIndexChanged.connect(self.hardware_changed)
+        self.all_gpus.toggled.connect(self.hardware_changed)
         self.scratch = QLineEdit(settings.get('scratch',''))
         scratch_row = QWidget()
         layout = row(self.scratch, button('Browse', self.browse))
@@ -170,10 +184,30 @@ class SettingsPage(QWidget):
         card.box.addLayout(row(button('Save settings', lambda: settings.set('scratch',self.scratch.text())),
                                 button('Re-probe hardware', self.reprobe.emit)))
         card.box.addLayout(row(button('Restart as administrator', self.admin), button('Show monitor', self.monitor_requested.emit)))
+        self.ffmpeg_path = QLineEdit(settings.get('ffmpeg_path', ''))
+        self.ffprobe_path = QLineEdit(settings.get('ffprobe_path', ''))
+        for title, edit in [('Custom FFmpeg executable', self.ffmpeg_path), ('Custom FFprobe executable', self.ffprobe_path)]:
+            edit.setPlaceholderText('Empty = bundled / PATH')
+            card.box.addWidget(label(title, 'muted'))
+            card.box.addLayout(row(edit, button('Browse executable', lambda _, e=edit: self.browse_executable(e))))
+        card.box.addWidget(button('Apply tool paths + re-scan', lambda: self.tools_changed.emit(
+            self.ffmpeg_path.text().strip(), self.ffprobe_path.text().strip())))
         self.capabilities = label('Checking FFmpeg / QSV…', 'muted')
         card.box.addWidget(self.capabilities)
         box.addWidget(card)
         box.addStretch()
+
+    def hardware_changed(self, *_):
+        self.settings.set('hardware', selected(self.hardware))
+        self.settings.set('failure_policy', selected(self.failures))
+        self.settings.set('use_all_gpus', self.all_gpus.isChecked())
+        self.hardware_policy_changed.emit()
+
+    def browse_executable(self, edit):
+        path = QFileDialog.getOpenFileName(self, 'Choose executable', edit.text(),
+                                          'Executables (*.exe);;All files (*)')[0]
+        if path:
+            edit.setText(path)
 
     def browse(self):
         value = dialogs.folder(self)

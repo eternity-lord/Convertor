@@ -252,7 +252,7 @@ class EncodingWindow(GlassWindow):
         if job.status == 'Encoding' and now - self.last_preview > 3 and not self.preview_busy:
             self.last_preview = now
             self.preview_busy = True
-            threading.Thread(target=self.grab_preview, args=(job.id, job.media, dict(self.manager.capabilities), d.get('media_time',0)), daemon=True).start()
+            threading.Thread(target=self.grab_preview, args=(job.id, job.media, dict(self.manager.capabilities, _preview_encoder_id=d.get('encoder_id')), d.get('media_time',0)), daemon=True).start()
 
     def report_preview_status(self, identity, message):
         if self.preview_messages.get(identity) != message:
@@ -266,7 +266,7 @@ class EncodingWindow(GlassWindow):
         path = data_dir() / 'preview.jpg'
         try:
             command, gpu = preview_command(media, caps, timestamp, path, tool('ffmpeg'))
-            status = ('Preview: Using QSV · ' + command[command.index('-init_hw_device') + 1]
+            status = ('Preview: Using ' + command[command.index('-hwaccel') + 1] + ' · ' + command[command.index('-init_hw_device') + 1]
                       if gpu else 'Preview: CPU decode (source codec/pixel format or QSV decode self-test unsupported)')
             try:
                 capture(command, timeout=8)
@@ -337,11 +337,27 @@ class EncodingWindow(GlassWindow):
                 action.setEnabled(job.status in TERMINAL)
             if text == 'Skip analysis':
                 action.setEnabled(job.status in ('Waiting','Analyzing'))
+        hardware_menu = menu.addMenu('Hardware for this job')
+        devices = [(d, d) for d in ['Global', 'Auto', 'Intel', 'NVIDIA', 'AMD', 'CPU']]
+        matrix = self.manager.capabilities.get('matrix', {})
+        devices += [(g['id'], g['name'] + ' [runtime slot]') for g in matrix.get('gpus', [])
+                    if g['vendor'] != 'CPU' and any(c['gpu_id'] == g['id'] for c in matrix.get('encoders', []))]
+        for device, title in devices:
+            action = hardware_menu.addAction(title)
+            action.setData('hardware:' + device)
+            available = device in ('Global', 'Auto') or any(c['available'] and device in (c['vendor'], c['gpu_id']) for c in matrix.get('encoders', []))
+            action.setEnabled(available and (job.status in TERMINAL or job.status == 'Waiting'))
+            if not available:
+                action.setToolTip('No encoder passed a hardware test for this device')
+            action.setCheckable(True)
+            action.setChecked(job.options.hardware == device)
         chosen = menu.exec(self.table.viewport().mapToGlobal(position))
         if not chosen:
             return
         text = chosen.data()
-        if text == 'Remove':
+        if text.startswith('hardware:'):
+            job.options.hardware = text.split(':', 1)[1]
+        elif text == 'Remove':
             self.manager.jobs.remove(job)
         elif text == 'Move to top':
             self.manager.jobs.remove(job)

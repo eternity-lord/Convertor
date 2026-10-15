@@ -120,3 +120,22 @@ def probe_capabilities(force=False):
     temp.write_text(json.dumps(data, indent=2), encoding='utf-8')
     temp.replace(cache)
     return data
+
+
+def probe_engine(force=False, progress=None, cancel=None):
+    """Universal engine with a legacy QSV view for the existing Advanced page."""
+    from .hardware.probe import scan_hardware
+    matrix = scan_hardware(force, progress, cancel)
+    intel = next((c for c in matrix.encoders if c.name == 'h264_qsv' and c.available), None)
+    codecs = {}
+    for c in matrix.encoders:
+        if c.vendor == 'Intel' and (c.name not in codecs or c.available):
+            codecs[c.name] = dict(available=c.available, reason=c.reason,
+                                  icq='ICQ' in c.modes, tested_options=list(c.tested_values))
+    return dict(matrix=matrix.to_dict(), codecs=codecs,
+                qsv_device=next((v for v in (intel.device_args if intel else []) if v.startswith('qsv=')), None),
+                adapter='\n'.join(g.name for g in matrix.gpus),
+                haswell=bool(intel and intel.features.get('haswell')), decode=bool(intel and any(d['available'] for d in intel.decoders)),
+                decode_codecs=sorted({d['codec'] for d in intel.decoders if d['available']}) if intel else [],
+                vpp_qsv=bool(intel and intel.gpu_filters.get('available')),
+                vpp_framerate=bool(intel and intel.gpu_filters.get('available')))

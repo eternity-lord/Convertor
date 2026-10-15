@@ -16,9 +16,14 @@ class Plan:
     duration: float
     codec: str = 'h264'
     encoding_status: str = ''
+    encoder_id: str = ''
+    gpu_id: str = ''
 
 
-def build_command(media, options, output, capabilities=None, software=False, executable=None):
+def build_command(media, options, output, capabilities=None, software=False, executable=None, selection=None):
+    if capabilities and capabilities.get("matrix"):
+        from .hardware.planning import build_hardware_command
+        return build_hardware_command(media, options, output, capabilities, software, executable, build_command, selection)
     caps = capabilities or {}
     target = choose_target(media, options)
     fps = str(target.fps)

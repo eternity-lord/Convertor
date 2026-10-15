@@ -26,6 +26,19 @@ def can_decode(media, caps):
 
 
 def preview_command(media, caps, timestamp, output, executable):
+    if caps.get('matrix'):
+        from .hardware.matrix import HardwareMatrix
+        from .hardware.select import Request, choose_pipeline
+        from .hardware.planning import preview_from_selection
+        matrix = HardwareMatrix.from_dict(caps['matrix'])
+        selected_id = caps.get('_preview_encoder_id')
+        selected = next((c for c in matrix.encoders if c.id == selected_id), None)
+        request = Request(codec=selected.codec if selected else 'h264', width=2, height=2, fps=1,
+                          device=selected.gpu_id if selected else 'Auto', source_codec=media.video.get('codec_name', ''),
+                          source_format=media.video.get('pix_fmt', ''), source_width=int(media.video.get('width', 0)),
+                          source_height=int(media.video.get('height', 0)), source_fps=float(media.fps))
+        choice = choose_pipeline(matrix, request, [c.id for c in matrix.encoders if selected and c.id != selected.id])
+        return preview_from_selection(media, choice, timestamp, output, executable)
     gpu = can_decode(media, caps)
     cmd = [executable, '-nostdin', '-v', 'error', '-y']
     if gpu:

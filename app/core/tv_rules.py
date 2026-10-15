@@ -58,6 +58,10 @@ class Options:
     safe_mode: bool = True
     high_priority: bool = False
     bframes: int = 2
+    hardware: str = 'Global'
+    failure_policy: str = 'Use next'
+    quality_speed: str = 'Global'
+    language: str = 'en'
 
 
 def auto_level(width, height, fps):

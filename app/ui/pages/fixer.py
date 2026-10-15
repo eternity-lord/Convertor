@@ -37,7 +37,7 @@ class FixerPage(QWidget):
         opts = Options(**{k: v for k, v in stored.items() if k in allowed})
         self.controls = {}
         self.encoder_choice = combo(['h264_qsv', 'hevc_qsv', 'av1_qsv'], opts.codec)
-        self.encoder_choice.setToolTip('HEVC / AV1 require modern playback devices. CPU fallback always uses AVC for compatibility.')
+        self.encoder_choice.setToolTip('HEVC / AV1 require modern playback devices. The hardware engine preserves the target codec across GPUs / CPU. Missing encoders are disabled.')
         self.encoder_choice.setVisible(hqx)
         self.box = QVBoxLayout(self)
         self.box.setSpacing(15)
@@ -65,12 +65,22 @@ class FixerPage(QWidget):
         preset_card.box.addWidget(self.simulation)
         preset_card.box.addWidget(self.skip)
         grid.addWidget(preset_card, 0, 0)
+        hardware_card = Card('Hardware')
+        hardware_form = QFormLayout()
+        self.field(hardware_form, 'Hardware for these jobs', 'hardware', combo(
+            ['Global', 'Auto', 'Intel', 'NVIDIA', 'AMD', 'CPU'], opts.hardware))
+        self.field(hardware_form, 'Quality / speed', 'quality_speed', combo(
+            ['Global', 'Fast', 'Balanced', 'High Quality', 'Max Quality'], opts.quality_speed))
+        self.controls['hardware'].setToolTip('Global follows Settings when queued work starts; vendor choices prefer that vendor, then visibly try the next proven option.')
+        self.controls['quality_speed'].setToolTip('Global follows the existing QSV Advanced preset, translated for each encoder. Only presets that passed a hardware test are used; substitutions are logged.')
+        hardware_card.box.addLayout(hardware_form)
+        self.box.addWidget(hardware_card)
         video = Card('Video')
         form = QFormLayout()
         self.field(form, 'Profile', 'profile', combo(['baseline', 'main', 'high'], opts.profile))
         self.controls['profile'].setToolTip('TV mode disables High10 / High422 / High444: only 8-bit 4:2:0 is safe.')
         self.field(form, 'Level', 'level', combo(['Auto', '3.0', '3.1', '3.2', '4.0', '4.1', '4.2', '5.0', '5.1', '5.2'], opts.level))
-        self.field(form, 'Rate control', 'rc', combo(['VBR', 'CBR', 'Quality'], 'Quality' if opts.rc in ('CQP', 'ICQ') else opts.rc))
+        self.field(form, 'Rate control', 'rc', combo(['VBR', 'CBR', 'Quality', 'CQ', 'ICQ'], 'Quality' if opts.rc in ('CQP', 'ICQ') else opts.rc))
         self.controls['rc'].setToolTip('Quality uses tested ICQ; if unsupported, uses explicit VBR with the selected bitrate/maxrate/buffer. Software uses CRF.')
         for title, key in [('Bitrate (Mbps)', 'bitrate'), ('Maxrate (Mbps)', 'maxrate'), ('Buffer (Mbps)', 'bufsize')]:
             spin = QDoubleSpinBox()
@@ -134,7 +144,46 @@ class FixerPage(QWidget):
                     button('Stop Watching' if hqx else 'Stop all', self.stop)]
         self.box.addLayout(row(*controls))
         self.box.addStretch()
+        self._saved_hardware = opts.hardware
+        self._hardware_caps = None
+        self.encoder_choice.currentIndexChanged.connect(lambda _: self.apply_hardware_caps(self._hardware_caps))
+        self.controls['hardware'].currentIndexChanged.connect(lambda _: self.apply_hardware_caps(self._hardware_caps))
+        self.hevc.toggled.connect(lambda _: self.apply_hardware_caps(self._hardware_caps))
         self.preset_changed()
+
+    def apply_hardware_caps(self, caps):
+        if not caps or not caps.get('matrix'):
+            return
+        from app.core.hardware.select import codec_of
+        from app.core.hardware.matrix import HardwareMatrix
+        self._hardware_caps = caps
+        matrix = HardwareMatrix.from_dict(caps['matrix'])
+        codec = codec_of(selected(self.encoder_choice)) if self.hqx else ('hevc' if selected(self.preset) == '4K TV' and self.hevc.isChecked() else 'h264')
+        control = self.controls['hardware']
+        control.blockSignals(True)
+        for gpu in matrix.gpus:
+            if gpu.vendor != 'CPU' and any(c.gpu_id == gpu.id for c in matrix.encoders) and control.findData(gpu.id) < 0:
+                control.addItem(gpu.name + ' [tested runtime slot]', gpu.id)
+        if self._saved_hardware and control.findData(self._saved_hardware) >= 0:
+            control.setCurrentIndex(control.findData(self._saved_hardware))
+            self._saved_hardware = None
+        control.blockSignals(False)
+        for i in range(control.count()):
+            vendor = control.itemData(i)
+            available = vendor in ('Global', 'Auto') or any(c.available and (c.vendor == vendor or c.gpu_id == vendor) and c.codec == codec for c in matrix.encoders)
+            control.model().item(i).setEnabled(available)
+            control.setItemData(i, '' if available else 'No tested ' + codec + ' encoder for this vendor', 3)
+        device = selected(control)
+        if device == 'Global':
+            device = self.settings.get('hardware', 'Auto')
+        choices = [c for c in matrix.encoders if c.available and c.codec == codec and (device == 'Auto' or c.vendor == device or c.gpu_id == device)]
+        rc = self.controls['rc']
+        for i in range(rc.count()):
+            value = rc.itemData(i)
+            available = any((bool(set(c.modes) & {'CQ', 'ICQ'}) if value == 'Quality' else
+                             ('CQ' in c.modes if value == 'ICQ' and c.vendor != 'Intel' else value in c.modes)) for c in choices)
+            rc.model().item(i).setEnabled(available)
+            rc.setItemData(i, '' if available else 'This rate control has not passed a test on the selected vendor / codec', 3)
 
     def field(self, layout, title, key, widget):
         self.controls[key] = widget
@@ -145,6 +194,7 @@ class FixerPage(QWidget):
         self.description.setText(DESCRIPTIONS[preset])
         self.hevc.setVisible(preset == '4K TV' and not self.hqx)
         self.controls['profile'].setEnabled(preset == 'Custom')
+        self.apply_hardware_caps(self._hardware_caps)
 
     def choose_path(self, edit):
         value = dialogs.folder(self, edit.text())
@@ -173,6 +223,8 @@ class FixerPage(QWidget):
         opts.high_priority = self.settings.get('high_priority',False)
         opts.encoder_preset = self.settings.get('encoder_preset', 'medium')
         opts.advanced = self.settings.get('advanced', {})
+        opts.failure_policy = self.settings.get('failure_policy', 'Use next')
+        opts.language = self.settings.get('language', 'en')
         self.settings.set('hqx_options' if self.hqx else 'fixer_options', asdict(opts))
         self.settings.set('watch_folder' if self.hqx else 'fixer_folder', self.folder.text())
         return opts

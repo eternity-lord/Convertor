@@ -9,6 +9,7 @@ from .worker import EncodeWorker
 from .ffprobe import probe
 from .pipeline import output_path
 from .safety import LOW_RAM_BYTES, SustainedLoadGuard
+from .hardware.runtime import DeviceSlots
 
 TERMINAL = {'TV-Safe ✓', 'Done', 'Warning', 'Blocked', 'Failed', 'Skipped'}
 ACTIVE = {'Analyzing', 'Encoding', 'Paused', 'Verifying'}
@@ -42,11 +43,18 @@ class QueueManager(QObject):
     analyzed = Signal(str, object)
     analysis_done = Signal()
     safety_alert = Signal(str)
+    fallback_needed = Signal(str, dict)
 
     def __init__(self):
         super().__init__()
         self.jobs = []
         self.capabilities = {}
+        self.hardware_scanning = False
+        self.global_hardware = 'Auto'
+        self.failure_policy = 'Use next'
+        self.use_all_gpus = False
+        self.quality_speed = 'Balanced'
+        self.device_slots = DeviceSlots()
         self.running = False
         self.paused = False
         self.limit = 0
@@ -99,6 +107,8 @@ class QueueManager(QObject):
         if 'errors' in changes:
             changes['errors'] = [str(x)[:2000] for x in changes['errors'][:20]]
         job.data.update(changes)
+        if 'fallback_request' in changes:
+            self.fallback_needed.emit(identity, changes['fallback_request'])
         if 'media' in changes:
             job.media = changes['media']
         details = changes.get('details', '')
@@ -176,6 +186,12 @@ class QueueManager(QObject):
             self.start()
 
     def start(self):
+        if self.hardware_scanning:
+            self.log.emit('WARN', 'Hardware scan in progress. Start the queue after it completes.', '', '')
+            return
+        if self.capabilities.get('error'):
+            self.log.emit('ERROR', 'Hardware / FFmpeg configuration failed: ' + self.capabilities['error'], '', '')
+            return
         self.finished_at = None
         if self.analysis_running:
             self.log.emit('WARN', 'Wait for analysis to finish before starting.', '', '')
@@ -193,7 +209,7 @@ class QueueManager(QObject):
         self.tick()
 
     def tick(self):
-        if not self.running or self.paused:
+        if not self.running or self.paused or self.hardware_scanning:
             return
         active = [j for j in self.jobs if j.thread and j.thread.is_alive()]
         waiting = [j for j in self.jobs if j.status == 'Waiting']
@@ -226,10 +242,40 @@ class QueueManager(QObject):
             base = self.baselines.get(job.data.get('pipeline'))
             if len(active) > 1 and elapsed > 20 and base and speed < base * .8:
                 limit = 1
-        for job in waiting[:max(0, limit - len(active))]:
-            if not job.options.simulation:
+        started_now = 0
+        device_counts = {}
+        for item in active:
+            gpu_id = item.data.get('gpu_id', '')
+            device_counts[gpu_id] = device_counts.get(gpu_id, 0) + 1
+        for job in waiting:
+            if started_now >= max(0, limit - len(active)):
+                break
+            execution_options = copy.deepcopy(job.options)
+            if self.capabilities.get('matrix') and not execution_options.simulation:
+                from .hardware.matrix import HardwareMatrix
+                from .hardware.planning import request_for
+                from .hardware.select import choose_pipeline, distribute_devices, codec_of
+                matrix = HardwareMatrix.from_dict(self.capabilities['matrix'])
+                if execution_options.hardware == 'Global':
+                    execution_options.hardware = self.global_hardware
+                if self.use_all_gpus and execution_options.hardware == 'Auto':
+                    assigned = distribute_devices(matrix, codec_of(execution_options.codec), device_counts, self.safe_mode)
+                    if assigned:
+                        execution_options.hardware = assigned
+                execution_options.failure_policy = self.failure_policy
                 try:
-                    destination = output_path(job.source, job.options)
+                    chosen = choose_pipeline(matrix, request_for(job.media, execution_options))
+                    gpu_id = chosen.encoder.gpu_id
+                    if device_counts.get(gpu_id, 0) >= (1 if self.safe_mode or gpu_id == 'cpu' else 3):
+                        continue
+                    job.data['gpu_id'] = gpu_id
+                    device_counts[gpu_id] = device_counts.get(gpu_id, 0) + 1
+                except (ValueError, AttributeError) as exc:
+                    self._update(job.id, {'status':'Blocked', 'errors':[str(exc)]})
+                    continue
+            if not execution_options.simulation:
+                try:
+                    destination = output_path(job.source, execution_options)
                     reserved = {j.data.get('reserved_output') for j in self.jobs if j is not job}
                     base, index = destination, 2
                     while str(destination) in reserved:
@@ -239,12 +285,15 @@ class QueueManager(QObject):
                 except Exception as exc:
                     self._update(job.id, {'status':'Failed', 'errors':[str(exc)]})
                     continue
-            job.options.safe_mode = self.safe_mode
-            job.options.high_priority = self.high_priority
+            if execution_options.quality_speed == 'Global':
+                execution_options.quality_speed = self.quality_speed
+            execution_options.safe_mode = self.safe_mode
+            execution_options.high_priority = self.high_priority
             job.data['status'] = 'Analyzing'
-            job.worker = EncodeWorker(job, job.options, self.capabilities, self.updated.emit)
+            job.worker = EncodeWorker(job, execution_options, self.capabilities, self.updated.emit, self.device_slots)
             job.thread = threading.Thread(target=job.worker.run, daemon=True)
             job.thread.start()
+            started_now += 1
         self.changed.emit()
 
     def stop_all(self):

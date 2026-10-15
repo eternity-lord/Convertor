@@ -1,6 +1,10 @@
 """All user-facing translations go through this module; runtime UI rebuild enables RTL."""
 LANGUAGE = 'en'
 FA = {
+    'Hardware': 'سخت‌افزار', 'Re-scan hardware': 'اسکن دوباره سخت‌افزار',
+    'Cancel scan': 'لغو اسکن', 'Use all tested GPUs': 'استفاده از همه گرافیک‌های آزموده‌شده',
+    'If hardware fails': 'اگر سخت‌افزار ناموفق بود', 'Quality / speed': 'کیفیت / سرعت',
+    'Hardware for these jobs': 'سخت‌افزار این کارها',
     'Dashboard': 'داشبورد', 'MP4 Profile Fixer': 'اصلاح فایل MP4',
     'HQX Converter': 'تبدیل HQX', 'QSV Advanced': 'تنظیمات پیشرفته QSV',
     'System Tweaks': 'بهینه‌سازی سیستم', 'Logs': 'گزارش‌ها', 'Settings': 'تنظیمات',

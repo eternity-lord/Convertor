@@ -118,3 +118,16 @@ Project layout: `main.py`, `app/core/` (probe, pipeline, TV rules, worker, queue
   Otherwise it explicitly uses VBR `-b:v/-maxrate/-bufsize` and reports that
   substitution. Software quality mode uses CRF. ICQ does not impose a VBR bitrate
   ceiling; choose VBR or CBR when a strict TV bitrate budget is needed.
+
+### Round 3 · Phase 1: Universal hardware engine
+
+The **Hardware** page now records real per-encoder tests for Intel QSV, NVIDIA
+NVENC/CUDA, AMD AMF, hardware-only Media Foundation and the listed CPU encoders.
+Settings supports custom FFmpeg/FFprobe paths, vendor/runtime-slot selection,
+re-scan, opt-in multi-device dispatch and Ask / Use next / Use CPU / Stop recovery.
+TV/HQX output, CFR unification, Safe mode, source preservation and verification
+remain shared with the original engine. Unknown capabilities are not enabled.
+
+See [Phase 1 architecture, evidence boundaries and PC test checklist](docs/phase1-hardware-engine.md).
+Enhancement, Universal Converter and the preset/help overhaul are later phases,
+not features claimed by this change.
