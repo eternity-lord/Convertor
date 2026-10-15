@@ -7,6 +7,10 @@ from ..tv_rules import choose_target
 
 
 def request_for(media, options, cpu=False):
+    from ..enhance.model import enabled
+    if enabled(options):
+        from ..enhance.planning import headroom
+        options, _ = headroom(media, options)
     target = choose_target(media, options)
     return Request(codec=codec_of(options.codec), width=target.width, height=target.height,
                    fps=float(target.fps), rate_control=options.rc, device='CPU' if cpu else ('Auto' if options.hardware == 'Global' else options.hardware),

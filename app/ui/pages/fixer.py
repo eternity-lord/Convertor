@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QLineEdit, QCo
 from app.core.tv_rules import Options, PRESETS, DESCRIPTIONS
 from app.ui.widgets.common import Card, Pills, Toggle, label, button, row
 from app.ui import dialogs
+from app.ui.widgets.enhance_card import EnhanceCard
 from app.i18n import tr
 
 
@@ -139,6 +140,8 @@ class FixerPage(QWidget):
         audio.box.addWidget(label('TV audio is always re-encoded to AAC-LC stereo 48 kHz, 192 kbps. Legacy Copy settings cannot bypass safety. Multiple audio tracks may not play on older TVs.', 'muted'))
         grid.addWidget(audio, 2, 1)
         self.box.addLayout(grid)
+        self.enhance_card = EnhanceCard(opts.enhance, self.options, manager)
+        self.box.addWidget(self.enhance_card)
         controls = [button('Add folder', self.add_only), button('Analyze files', self.analyze),
                     button('Start Watching' if hqx else 'Start Fix', self.start, True),
                     button('Stop Watching' if hqx else 'Stop all', self.stop)]
@@ -157,6 +160,7 @@ class FixerPage(QWidget):
         from app.core.hardware.select import codec_of
         from app.core.hardware.matrix import HardwareMatrix
         self._hardware_caps = caps
+        self.enhance_card.set_capabilities(caps)
         matrix = HardwareMatrix.from_dict(caps['matrix'])
         codec = codec_of(selected(self.encoder_choice)) if self.hqx else ('hevc' if selected(self.preset) == '4K TV' and self.hevc.isChecked() else 'h264')
         control = self.controls['hardware']
@@ -226,6 +230,7 @@ class FixerPage(QWidget):
         opts.advanced = self.settings.get('advanced', {})
         opts.failure_policy = self.settings.get('failure_policy', 'Use next')
         opts.language = self.settings.get('language', 'en')
+        opts.enhance = self.enhance_card.settings()
         self.settings.set('hqx_options' if self.hqx else 'fixer_options', asdict(opts))
         self.settings.set('watch_folder' if self.hqx else 'fixer_folder', self.folder.text())
         return opts

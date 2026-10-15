@@ -50,6 +50,7 @@ class QueueManager(QObject):
         self.jobs = []
         self.capabilities = {}
         self.hardware_scanning = False
+        self.preview_lock = threading.Lock()
         self.global_hardware = 'Auto'
         self.failure_policy = 'Use next'
         self.use_all_gpus = False
@@ -186,6 +187,9 @@ class QueueManager(QObject):
             self.start()
 
     def start(self):
+        if self.preview_lock.locked():
+            self.log.emit('WARN', 'Finish/cancel the enhancement preview before starting the queue.', '', '')
+            return
         if self.hardware_scanning:
             self.log.emit('WARN', 'Hardware scan in progress. Start the queue after it completes.', '', '')
             return

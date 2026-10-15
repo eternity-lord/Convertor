@@ -143,7 +143,7 @@ def probe(path, scan=True, cancel=None, step=None, fallback_fps='25'):
             'width','height','pix_fmt','field_order','sample_aspect_ratio',
             'r_frame_rate','avg_frame_rate','nb_frames','duration','start_time',
             'time_base','color_space','color_transfer','color_primaries','color_range',
-            'bit_rate','sample_rate','channels','channel_layout','refs'}
+            'bit_rate','sample_rate','channels','channel_layout','refs','chroma_location','side_data_list'}
     streams = [{key:value for key,value in stream.items() if key in keep}
                for stream in raw_streams]
     video = next((s for s in streams if s.get('codec_type') == 'video'), None)

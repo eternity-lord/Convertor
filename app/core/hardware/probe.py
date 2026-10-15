@@ -16,7 +16,7 @@ from .matrix import HardwareMatrix, EncoderCapabilities, GpuProfile, ENCODERS, C
 from .flagmap import mode_candidates, render, QualityModel
 from .errors import classify_error
 
-PROBE_REVISION = 3
+PROBE_REVISION = 4
 QSV_DEVICES = DEVICE_CANDIDATES + ('qsv=hw:hw_any',)
 
 
@@ -218,6 +218,11 @@ def scan_hardware(force=False, progress=None, cancel=None, run=capture):
                     cap.samples.append(dict(width=3840, height=2160, fps=30, bit_depth=8, chroma='420'))
 
     _probe_decoders(matrix, binary, execute)
+    from ..enhance.probe import probe_filters, probe_gpu_recipes
+    matrix.inventory['enhancement'] = probe_filters(binary, inventory, run, progress, cancel)
+    for cap in matrix.encoders:
+        if cap.hardware and cap.available:
+            probe_gpu_recipes(binary, cap, execute, inventory)
     temp = cache.with_suffix('.tmp')
     temp.write_text(json.dumps(matrix.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
     temp.replace(cache)

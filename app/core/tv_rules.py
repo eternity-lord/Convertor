@@ -62,6 +62,7 @@ class Options:
     failure_policy: str = 'Use next'
     quality_speed: str = 'Global'
     language: str = 'en'
+    enhance: dict = field(default_factory=lambda: {'level': 'Off'})
 
 
 def auto_level(width, height, fps):
@@ -111,6 +112,20 @@ def choose_target(media, options):
     w = round(w * float(sar))
     ratio = min(1, pw / w, ph / h)
     w, h = max(2, int(w * ratio) // 2 * 2), max(2, int(h * ratio) // 2 * 2)
+    from .enhance.model import effective
+    enhancement = effective(getattr(options, 'enhance', None))
+    if enhancement.level != 'Off' and enhancement.upscale != 'Keep':
+        if not media.metadata_verified:
+            raise ValueError('Explicit upscale needs verified source dimensions / aspect ratio. Analyze the source first.')
+        bound_w, bound_h = (1920, 1080) if enhancement.upscale == '1080p' else (3840, 2160)
+        if bound_w > pw or bound_h > ph:
+            raise ValueError('Explicit upscale exceeds the selected TV/resolution cap. Choose an appropriate TV preset/cap; no silent resize.')
+        original_w = int(media.video['width']) * float(sar)
+        original_h = int(media.video['height'])
+        up = min(bound_w / original_w, bound_h / original_h)
+        if up > 1:
+            w, h = max(2, int(original_w * up)//2*2), max(2, int(original_h * up)//2*2)
+            notes.append(f'Explicit interpolated upscale: {w}×{h}; not AI and no new recorded detail')
     level = auto_level(w, h, fps)
     if options.level != 'Auto':
         if float(options.level) < float(level):

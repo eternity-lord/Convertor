@@ -115,6 +115,10 @@ class MainWindow(GlassWindow):
 
     def build_ui(self):
         old = self.content
+        if old:
+            for page in (self.fixer, self.hqx):
+                page.options()
+                page.enhance_card.dispose()
         # Keep the bounded log model alive across language changes.
         self.logs.setParent(None)
         self.content = QWidget()
@@ -257,7 +261,7 @@ class MainWindow(GlassWindow):
             self.hqx.apply_hardware_caps(self.manager.capabilities)
 
     def apply_tool_paths(self, ffmpeg, ffprobe):
-        if self.cap_busy or self.manager.running or self.manager.analysis_running:
+        if self.cap_busy or self.manager.running or self.manager.analysis_running or self.manager.preview_lock.locked():
             self.logs.append('WARN', 'Stop / finish the queue and hardware scan before changing tools.')
             return
         self.settings.set('ffmpeg_path', ffmpeg)
@@ -272,7 +276,7 @@ class MainWindow(GlassWindow):
     def probe_hardware(self, force=False):
         if self.cap_busy:
             return
-        if self.manager.running or self.manager.analysis_running:
+        if self.manager.running or self.manager.analysis_running or self.manager.preview_lock.locked():
             self.logs.append('WARN', 'Stop / finish the queue before re-scanning hardware (probes use GPU sessions).')
             return
         self.cap_busy = True
@@ -572,6 +576,9 @@ class MainWindow(GlassWindow):
             return
         self.closing = True
         self.scan_cancel.set()
+        for page in (self.fixer,self.hqx):
+            page.options()
+            page.enhance_card.dispose()
         for dialog in list(self.fallback_dialogs.values()):
             dialog.reject()
         self.timer.stop()

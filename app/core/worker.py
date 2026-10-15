@@ -7,6 +7,7 @@ import shutil
 import threading
 import time
 import uuid
+import tempfile
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import replace
@@ -17,6 +18,7 @@ from .process import spawn, terminate_tree, ToolError, tool
 from .tv_rules import verify, faststart_ok, estimate_bytes
 from .safety import reserved_affinity
 from .hardware.errors import classify_error
+from .enhance.model import enabled as enhancement_enabled
 
 
 class Cancelled(Exception):
@@ -69,7 +71,7 @@ class EncodeWorker:
     def _encode(self, plan):
         self.emit(self.job.id, {'status': 'Encoding', 'command': plan.command,
                                'pipeline': plan.pipeline, 'encoding_status': plan.encoding_status, 'target': plan.target,
-                               'encoder_id':plan.encoder_id, 'gpu_id':plan.gpu_id})
+                               'encoder_id':plan.encoder_id, 'gpu_id':plan.gpu_id, 'enhancement':plan.enhancement})
         try:
             self.process = spawn(plan.command, priority=self.options.high_priority)
         except OSError as exc:
@@ -169,9 +171,9 @@ class EncodeWorker:
             cmd[-1:-1] = ['-t', '0.2']
         self.preflight_record = {'command':cmd, 'stderr':'', 'success':False}
         try:
-            self.emit(self.job.id, {'status':'Analyzing', 'step':'Testing exact job flags / source on selected GPU…',
+            self.emit(self.job.id, {'status':'Analyzing', 'step':'Testing exact source / enhancement / encoder chain…',
                                    'encoding_status':plan.encoding_status, 'pipeline':plan.pipeline,
-                                   'encoder_id':plan.encoder_id, 'gpu_id':plan.gpu_id, 'command':cmd})
+                                   'encoder_id':plan.encoder_id, 'gpu_id':plan.gpu_id, 'enhancement':plan.enhancement, 'command':cmd})
             text = capture(cmd, timeout=10, cancel=self.cancel, include_stderr=True)
             self.preflight_record.update(stderr=text[-5000:], success=True)
             if re.search(r'has not been used for any stream|falling back to.*software|default.*CQP|CQP.{0,80}default|constant quantization.*default', text, re.I):
@@ -180,7 +182,8 @@ class EncodeWorker:
             self.preflight_record.update(stderr=str(exc)[-5000:], success=False)
             if self.cancel.is_set():
                 raise Cancelled()
-            raise EncodeFailure('Exact-job hardware preflight failed: ' + str(exc)) from exc
+            label = 'enhancement / encoder' if plan.enhancement else 'hardware'
+            raise EncodeFailure(f'Exact-job {label} preflight failed: ' + str(exc)) from exc
         finally:
             path.unlink(missing_ok=True)
 
@@ -194,6 +197,7 @@ class EncodeWorker:
             blocks.append(f'Attempt {index} — exact FFmpeg command:\n' +
                           subprocess.list2cmdline(attempt['command']) +
                           '\n\n' + attempt.get('encoding_status', '') +
+                          '\n\nEnhancement:\n' + json.dumps(attempt.get('enhancement', {}), ensure_ascii=False, indent=2) +
                           '\n\nExact-job preflight:\n' + json.dumps(attempt.get('preflight', {}), ensure_ascii=False, indent=2) +
                           '\n\nStderr tail:\n' + attempt['stderr'] +
                           '\n\nOUTPUT ffprobe values:\n' +
@@ -218,6 +222,7 @@ class EncodeWorker:
 
     def run(self):
         temporaries, attempts = [], []
+        ai_folder = None
         valid = None
         try:
             self.emit(self.job.id, {'status':'Analyzing'})
@@ -239,7 +244,7 @@ class EncodeWorker:
                           'details':'OUTPUT ffprobe values:\n' + json.dumps(probe_values(media),indent=2),
                           'progress':100})
                 return
-            if self.options.skip_safe and not current_errors and faststart_ok(media.path):
+            if self.options.skip_safe and not current_errors and faststart_ok(media.path) and not enhancement_enabled(self.options):
                 self.emit(self.job.id, {'status':'Skipped', 'reason':'Already TV-safe'})
                 return
             destination = Path(self.job.data['reserved_output']) if self.job.data.get('reserved_output') else output_path(self.job.source, self.options)
@@ -250,6 +255,17 @@ class EncodeWorker:
             folder = Path(self.options.scratch) if self.options.scratch else destination.parent
             folder.mkdir(parents=True, exist_ok=True)
             self.emit(self.job.id, {'output':str(destination)})
+            from .enhance.ai import ai_preprocess
+            from .enhance.model import effective
+            source_media = media
+            ai_notes = []
+            settings = effective(self.options.enhance)
+            if settings.level != 'Off' and settings.ai_enabled:
+                from .enhance.planning import headroom
+                headroom(media, self.options)  # Reject TV/upscale/Excellent cap conflicts before expensive external work.
+                ai_folder = tempfile.TemporaryDirectory(prefix='edius-ai-', dir=folder)
+                media, ai_notes = ai_preprocess(media, self.options, ai_folder.name, self.cancel, self._step)
+                self.emit(self.job.id, {'warning':'; '.join(ai_notes), 'step':'External AI intermediate ready'})
             options = self.options
             fallback_reason = ''
             universal = bool(self.capabilities.get('matrix'))
@@ -280,17 +296,20 @@ class EncodeWorker:
                         raise
                 plan = build_command(media, options, temporary, self.capabilities,
                                      software=force_cpu if universal else attempt > 0, **({'selection':selection} if universal else {}))
+                if ai_notes:
+                    plan.enhancement['external_ai'] = ai_notes
+                    plan.encoding_status += ' · ' + '; '.join(ai_notes[:2])
                 if attempt and fallback_reason:
                     plan.encoding_status += ' · Fallback reason: ' + fallback_reason
                 if estimate_bytes(media.duration, plan.target) > 3.9e9:
                     self.emit(self.job.id, {'warning':'Estimated output exceeds FAT32 3.9 GB; use exFAT/NTFS or select split.'})
-                record = {'command':plan.command, 'encoding_status':plan.encoding_status, 'stderr':'', 'probe':{'not_run':True}}
+                record = {'command':plan.command, 'encoding_status':plan.encoding_status, 'enhancement':plan.enhancement, 'stderr':'', 'probe':{'not_run':True}}
                 attempts.append(record)
                 try:
                     claim = (self.device_slots.claim(plan.gpu_id, 1 if options.safe_mode or plan.gpu_id == 'cpu' else 3, self.cancel)
                              if self.device_slots and universal else nullcontext())
                     with claim:
-                        if universal and selection.encoder.hardware:
+                        if (universal and selection.encoder.hardware) or plan.enhancement:
                             self.preflight_record = None
                             try:
                                 self._preflight_hardware(plan, folder)
@@ -329,6 +348,13 @@ class EncodeWorker:
                 self.emit(self.job.id, {'status':'Verifying', 'step':'Inspecting output…'})
                 result, violations, values = self._inspect(temporary, plan, options)
                 record['probe'] = values
+                if settings.level == 'Excellent' and result:
+                    from .enhance.planning import source_bitrate
+                    original_rate, actual_rate = source_bitrate(source_media), source_bitrate(result)
+                    if original_rate is None or actual_rate is None or actual_rate < original_rate:
+                        violations.append('Excellent actual bitrate floor not verified: source '
+                                          f'{original_rate if original_rate else "unknown"} Mbps; output {actual_rate if actual_rate else "unknown"} Mbps. '
+                                          'VBR budget is not a guaranteed measured bitrate; source retained.')
                 if not media.metadata_verified:
                     violations.append('Source metadata unverified: conservative dimensions / frame rate were used')
                 valid = [temporary, plan, result, violations]
@@ -372,7 +398,7 @@ class EncodeWorker:
                       'output':str(destination), 'parts':parts, 'details':self._details(attempts),
                       'output_probe':probe_values(result) if result else {'error':reason},
                       'command':plan.command, 'pipeline':plan.pipeline,
-                      'encoding_status':plan.encoding_status, 'size':destination.stat().st_size})
+                      'encoding_status':plan.encoding_status, 'enhancement':plan.enhancement, 'size':destination.stat().st_size})
             # A warning/unknown analysis can never authorize destructive source deletion.
             if options.delete_source and not violations and media.cadence.verified:
                 self.job.source.unlink()
@@ -386,6 +412,8 @@ class EncodeWorker:
                 self.emit(self.job.id, {'status':status, 'reason':str(exc), 'errors':[str(exc)],
                                        'details':self._details(attempts) or ''.join(self.stderr)[-12000:]})
         finally:
+            if ai_folder is not None:
+                ai_folder.cleanup()
             for path in temporaries:
                 path.unlink(missing_ok=True)
 

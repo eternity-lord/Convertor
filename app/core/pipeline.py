@@ -1,6 +1,6 @@
 """Build explicit, auditable commands. Hardware filters are gated by capability results."""
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from .process import tool
 from .safety import encoding_threads
@@ -18,12 +18,18 @@ class Plan:
     encoding_status: str = ''
     encoder_id: str = ''
     gpu_id: str = ''
+    enhancement: dict = field(default_factory=dict)
 
 
 def build_command(media, options, output, capabilities=None, software=False, executable=None, selection=None):
+    from .enhance.integrate import build_enhanced_command
+    return build_enhanced_command(media, options, output, capabilities or {}, software, executable, selection, _build_base_command)
+
+
+def _build_base_command(media, options, output, capabilities=None, software=False, executable=None, selection=None):
     if capabilities and capabilities.get("matrix"):
         from .hardware.planning import build_hardware_command
-        return build_hardware_command(media, options, output, capabilities, software, executable, build_command, selection)
+        return build_hardware_command(media, options, output, capabilities, software, executable, _build_base_command, selection)
     caps = capabilities or {}
     target = choose_target(media, options)
     fps = str(target.fps)

@@ -131,3 +131,14 @@ remain shared with the original engine. Unknown capabilities are not enabled.
 See [Phase 1 architecture, evidence boundaries and PC test checklist](docs/phase1-hardware-engine.md).
 Enhancement, Universal Converter and the preset/help overhaul are later phases,
 not features claimed by this change.
+
+## Round 3 — Phase 2: opt-in Quality Enhancement
+
+Fixer and HQX now share an **Enhance Quality** card: Off (default), Low, Balanced,
+Excellent and Custom; async split before/after and optional three-second preview;
+proved CPU/GPU filters, explicit color/HDR conversion and dithering; optional audio
+cleanup/loudness and explicitly selected interpolation/external-AI hook. It cannot
+recover unrecorded detail. Existing TV/CFR/Safe/Haswell rules remain in force.
+Excellent uses a higher VBR budget, **not a guaranteed actual bitrate floor**;
+a measured-floor warning preserves the original. Phase 3 Universal Converter is
+not started. See [Phase 2 behavior, limitations and exact PC checklist](docs/phase2-quality-enhancement.md).
