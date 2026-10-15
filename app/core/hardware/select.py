@@ -67,7 +67,7 @@ def rank_encoders(matrix, request, excluded=()):
             reason = cap.reason[:240]
         elif not cap.modes:
             reason = 'No tested rate-control mode'
-        elif ('ICQ' if request.rate_control in ('Quality', 'CQP', 'CRF', 'ICQ') and cap.vendor == 'Intel' else
+        elif ('ICQ' if request.rate_control in ('Quality', 'CQP', 'CRF', 'ICQ', 'CQ') and cap.vendor == 'Intel' else
               'CQ' if request.rate_control in ('Quality', 'CQP', 'CRF', 'ICQ') else request.rate_control) not in cap.modes and 'VBR' not in cap.modes:
             reason = 'Requested rate control and VBR fallback are unproven'
         elif cap.hardware and not any(sample_matches(s, request) for s in cap.samples):

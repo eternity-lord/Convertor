@@ -95,7 +95,7 @@ def test_exclusion_and_multi_gpu_distribution():
     assert distribute_devices(m,'h264',{'intel':1,'nvidia':1},False) in ('intel','nvidia')
 
 
-@pytest.mark.parametrize('vendor,rc,flag,value', [('Intel','Quality','-global_quality','23'),
+@pytest.mark.parametrize('vendor,rc,flag,value', [('Intel','Quality','-global_quality','23'),('Intel','CQ','-global_quality','23'),
     ('NVIDIA','CQ','-cq','23'),('NVIDIA','VBR','-preset','p4'),('AMD','VBR','-rc','vbr_peak'),
     ('CPU','CQ','-crf','23')])
 def test_mapping_only_tested_modes(vendor,rc,flag,value):
@@ -199,3 +199,18 @@ def test_device_slot_guard_cancellation_and_release():
         with slots.claim('nvidia',1,threading.Event()):
             raise RuntimeError('encode failed')
     assert slots.active['nvidia']==0
+
+
+
+def test_nearest_quality_preset_and_cq_only_encoder_policy():
+    cap=encoder('NVIDIA')
+    cap.tested_values['preset']=['p1','p4','p6']
+    flags,notes,_=mapped_flags(cap,QualityModel(speed='Max Quality'))
+    assert flags[flags.index('-preset')+1]=='p6'
+    assert any('nearest tested' in n for n in notes)
+    intel=encoder('Intel')
+    intel.modes={'ICQ':['-global_quality','{quality}']}
+    m=HardwareMatrix(encoders=[intel])
+    assert choose_pipeline(m,Request(rate_control='CQ')).encoder==intel
+    with pytest.raises(ValueError,match='rate control'):
+        choose_pipeline(m,Request(rate_control='VBR'))

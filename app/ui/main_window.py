@@ -128,12 +128,14 @@ class MainWindow(GlassWindow):
         sidebar.box.addWidget(label('   CREATIVE STUDIO / 07', 'muted'))
         sidebar.box.addSpacing(15)
         self.nav = {}
-        glyphs = ['◴', '▣', '▤', '⌘', '◇', '≡', '⚙', '◈']
+        glyphs = {'Dashboard':'◴', 'MP4 Profile Fixer':'▣', 'HQX Converter':'▤',
+                  'QSV Advanced':'⌘', 'Hardware':'▦', 'System Tweaks':'◇',
+                  'Logs':'≡', 'Settings':'⚙', 'Support':'◈'}
         for i, name in enumerate(PAGES):
-            if i == 6:
+            if name == 'Settings':
                 sidebar.box.addStretch()
                 sidebar.box.addWidget(button('Encoding queue', self.encoding.open))
-            btn = button(f'{glyphs[i]}   {tr(name)}', lambda checked=False,n=name: self.navigate(n))
+            btn = button(f'{glyphs.get(name, "◇")}   {tr(name)}', lambda checked=False,n=name: self.navigate(n))
             btn.setProperty('nav',True)
             btn.setCheckable(True)
             sidebar.box.addWidget(btn)

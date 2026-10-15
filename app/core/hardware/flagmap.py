@@ -53,6 +53,8 @@ def mapped_flags(cap, model, advanced=None):
     wanted = model.rc
     if wanted in ('Quality', 'CQP', 'CRF'):
         wanted = 'ICQ' if cap.vendor == 'Intel' else 'CQ'
+    if wanted == 'CQ' and cap.vendor == 'Intel':
+        wanted = 'ICQ'
     if wanted == 'ICQ' and cap.vendor != 'Intel':
         wanted = 'CQ'
     if wanted not in cap.modes:
@@ -75,8 +77,15 @@ def mapped_flags(cap, model, advanced=None):
     if preferred in tested:
         flags += ['-' + key, preferred]
     elif tested:
-        flags += ['-' + key, tested[0]]
-        notes.append(f'{preferred} preset not proven; using {tested[0]}')
+        order = ([f'p{i}' for i in range(1, 8)] if cap.vendor == 'NVIDIA' else
+                 ['speed', 'balanced', 'quality'] if cap.vendor == 'AMD' else
+                 [str(i) for i in range(12, -1, -1)] if cap.name == 'libsvtav1' else
+                 ['veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'])
+        preferred_index = order.index(preferred)
+        replacement = min(tested, key=lambda value: (abs(order.index(value) - preferred_index), -order.index(value))
+                          if value in order else (100, 0))
+        flags += ['-' + key, replacement]
+        notes.append(f'{preferred} preset not proven; using nearest tested preset {replacement}')
     # B-frames are global options but still require a successful hardware test.
     bvalues = cap.tested_values.get('bf', [])
     if str(model.bframes) in bvalues:

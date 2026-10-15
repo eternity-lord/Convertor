@@ -181,7 +181,8 @@ class FixerPage(QWidget):
         for i in range(rc.count()):
             value = rc.itemData(i)
             available = any((bool(set(c.modes) & {'CQ', 'ICQ'}) if value == 'Quality' else
-                             ('CQ' in c.modes if value == 'ICQ' and c.vendor != 'Intel' else value in c.modes)) for c in choices)
+                             ('CQ' in c.modes if value == 'ICQ' and c.vendor != 'Intel' else
+                              'ICQ' in c.modes if value == 'CQ' and c.vendor == 'Intel' else value in c.modes)) for c in choices)
             rc.model().item(i).setEnabled(available)
             rc.setItemData(i, '' if available else 'This rate control has not passed a test on the selected vendor / codec', 3)
 
