@@ -84,17 +84,11 @@ def test_custom_tool_paths_never_silently_ignore_missing_executable(tmp_path):
         TOOL_PATHS.clear();TOOL_PATHS.update(original)
 
 
-def test_queue_use_all_assigns_separate_devices_without_changing_user_options(tmp_path, monkeypatch):
+def test_queue_use_all_assigns_separate_devices_without_changing_user_options(tmp_path, monkeypatch, qt_application):
     from app.core.queue import QueueManager
     from tests_support import sample_media
-    from PySide6.QtCore import QCoreApplication
     import psutil
-    try:
-        from PySide6.QtWidgets import QApplication
-        application_type = QApplication
-    except ImportError:
-        application_type = QCoreApplication
-    app=QCoreApplication.instance() or application_type([])
+    app = qt_application
     manager=QueueManager();manager.timer.stop()
     manager.capabilities={'matrix':matrix('Intel','NVIDIA','CPU').to_dict()}
     manager.use_all_gpus=True;manager.limit=3;manager.running=True

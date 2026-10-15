@@ -12,6 +12,11 @@ from app.ui.main_window import MainWindow, PAGES
 from PySide6.QtCore import QEventLoop, QTimer
 
 
+@pytest.fixture(autouse=True)
+def keep_qt_application(qt_application):
+    return qt_application
+
+
 def close_window(window):
     loop=QEventLoop()
     window.cleanup_done.connect(loop.quit)
